@@ -1,0 +1,17 @@
+[package]
+name = "faith_ffi"
+version = "0.1.0"
+edition = "2024"
+description = "C interface to faith_move / faith_anim, for running Faith inside another game (the Skyrim plugin)"
+
+[lib]
+# staticlib: linked into the SKSE plugin; rlib for the tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+faith_move = { path = "../faith_move" }
+faith_anim = { path = "../faith_anim", features = ["retarget"] }
+me_assets = { path = "../me_assets" }
+glam = "0.32"
+# Faith's sounds: the same decoder (lewton) Bevy's audio uses in the app.
+rodio = { version = "0.22", default-features = false, features = ["playback", "lewton"] }

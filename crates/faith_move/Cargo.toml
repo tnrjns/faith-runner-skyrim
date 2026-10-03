@@ -1,0 +1,8 @@
+[package]
+name = "faith_move"
+version = "0.1.0"
+edition = "2024"
+description = "Engine-agnostic first-person parkour movement (Mirror's Edge style)"
+
+[dependencies]
+glam = "0.32"

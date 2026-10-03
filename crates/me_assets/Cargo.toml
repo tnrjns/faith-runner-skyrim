@@ -1,0 +1,13 @@
+[package]
+name = "me_assets"
+version = "0.1.0"
+edition = "2024"
+description = "Reads Mirror's Edge (UE3) first-person arms, animations and textures from a local install"
+
+[dependencies]
+lzokay-native = "0.1"
+glam = "0.32"
+
+[features]
+# Mirror's Edge's levels: static meshes, materials, lightmaps, collision, post-process settings.
+prologue = []

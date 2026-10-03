@@ -1,0 +1,19 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "default",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build",
+      "toolchainFile": "${sourceDir}/.tools/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+        "FAITH_DEPLOY_DIR": "$env{LOCALAPPDATA}/ModOrganizer/Skyrim Special Edition/mods/Faith Runner"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "default", "configuration": "RelWithDebInfo" }
+  ]
+}

@@ -1,0 +1,9 @@
+[package]
+name = "parkour_tool"
+version = "0.1.0"
+edition = "2024"
+description = "Reads a survey of a Skyrim city's collision and makes Faith-only collision patches and placements for visible connectors"
+
+[dependencies]
+faith_move = { path = "../faith_move" }
+glam = "0.32"

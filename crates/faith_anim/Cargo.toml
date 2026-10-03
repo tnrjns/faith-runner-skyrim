@@ -1,0 +1,13 @@
+[package]
+name = "faith_anim"
+version = "0.1.0"
+edition = "2024"
+description = "Mirror's Edge's first-person animation, body placement and camera, driven by faith_move"
+
+[dependencies]
+faith_move = { path = "../faith_move" }
+me_assets = { path = "../me_assets" }
+glam = "0.32"
+
+[features]
+retarget = []

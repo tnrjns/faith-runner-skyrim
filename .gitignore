@@ -1,0 +1,4 @@
+/target/
+/skyrim/build/
+/skyrim/.tools/
+*.log
