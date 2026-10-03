@@ -107,6 +107,30 @@ pub trait World {
     }
 }
 
+/// Two worlds as one: a host's still collision and what moves in it (doors, gates, drawbridges),
+/// read again every frame. The fixtures are the first one's.
+pub struct Layered<'a> {
+    pub still: &'a dyn World,
+    pub moving: &'a dyn World,
+}
+
+impl World for Layered<'_> {
+    fn sweep(&self, half: Vec3, start: Vec3, delta: Vec3) -> Option<SweepHit> {
+        match (self.still.sweep(half, start, delta), self.moving.sweep(half, start, delta)) {
+            (Some(a), Some(b)) => Some(if b.t < a.t { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn overlaps(&self, region: &Aabb) -> bool {
+        self.still.overlaps(region) || self.moving.overlaps(region)
+    }
+
+    fn fixtures(&self) -> &[Fixture] {
+        self.still.fixtures()
+    }
+}
+
 /// How far a box may be inside something and still only be touching it.
 const TOUCH: f32 = 1e-4;
 /// How far a box may have sunk into a triangle surface and still be held by it (MeshWorld).

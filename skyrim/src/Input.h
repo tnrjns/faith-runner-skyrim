@@ -6,7 +6,8 @@ namespace faith::Input
 	// While on, Skyrim's own player controls don't get Faith's keys or the mouse look.
 	void SetCapturing(bool a_on);
 	// This frame's controls (and clears the per-frame presses and mouse motion).
-	FaithInput Take(float a_sensitivity);
+	// a_delta: the frame's time (the right stick turns at a rate).
+	FaithInput Take(float a_sensitivity, float a_delta = 0.0f);
 	// The toggle key was pressed since the last call.
 	bool TakeToggle();
 	// The viewmodel key (Faith's body / Skyrim's arms) was pressed since the last call.

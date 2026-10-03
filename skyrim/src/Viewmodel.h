@@ -19,6 +19,9 @@ namespace faith::Viewmodel
 	// Skyrim's first-person field of view setting that matches Faith's arms this frame (so what
 	// Skyrim's hidden first-person hands hold lines up with her hands).
 	float SkyrimFovFor(const FaithFrame& a_frame, float a_worldFovDeg);
+	// How much narrower the world's view (Skyrim's body is drawn with) is than Faith's arms':
+	// tan(world half FOV) / tan(arms' half FOV), for faith_set_screen_scale.
+	float BodyScreenScale(const FaithFrame& a_frame, float a_worldFovDeg);
 	// Mirror's Edge's speed blur over the scene (after the world, before Skyrim's tone mapping).
 	void SpeedBlur(float a_amount, bool a_late);
 }

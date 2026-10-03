@@ -1327,3 +1327,50 @@ fn indexed_world_matches_a_full_scan() {
         assert_eq!(key(&a), key(&b));
     }
 }
+
+/// TdMove_ZipLine's native tick: 600 units (6 m) from a wall ahead it braces for it
+/// (PrepareForForwardImpact), then hits it (PlayForwardImpact).
+#[test]
+fn zipline_braces_before_the_wall() {
+    let mut w = floor();
+    w.add(Aabb::new(Vec3::new(-5.0, 0.0, -32.0), Vec3::new(5.0, 10.0, -30.0)));
+    let (a, b) = (Vec3::new(0.0, 6.0, 0.0), Vec3::new(0.0, 5.0, -31.0));
+    let mut c = ctrl_at(Vec3::ZERO);
+    let u = (b - a).normalize();
+    c.feet = a + u * 0.5 - Vec3::Y * c.tuning.zip_hang;
+    c.state = State::ZipLine { a, b, s: 0.5, speed: 4.0 };
+    let mut braced_at = None;
+    let mut ev = Vec::new();
+    let mut t = 0.0;
+    while t < 10.0 && matches!(c.state, State::ZipLine { .. }) {
+        c.step(DT, &Input::default(), &w);
+        if braced_at.is_none() && c.events.contains(&Event::ZipBrace) {
+            braced_at = Some(c.feet.z);
+        }
+        ev.extend(c.events.iter().copied());
+        t += DT;
+    }
+    let z = braced_at.expect("braced");
+    // The body's front is half a width ahead of its centre.
+    let gap = (z - c.tuning.half_width) - (-30.0);
+    assert!((5.6..=6.1).contains(&gap), "braced {gap} m from the wall");
+    assert!(ev.contains(&Event::ZipEnd { hit_wall: true }), "{ev:?}");
+}
+
+/// A takedown only reaches someone close (TargetingMaxDistance, 3 m); which one plays follows
+/// where they face against the way to them: turned mostly sideways but a little away, from
+/// behind; a little towards her, from the front.
+#[test]
+fn takedowns_reach_close_and_follow_their_facing() {
+    let w = floor();
+    let at = |dist: f32, facing: Vec3| {
+        let mut c = ctrl_at(Vec3::ZERO);
+        // yaw 0 faces -Z: the target straight ahead.
+        c.targets = vec![Target { id: 1, centre: Vec3::new(0.0, 0.9, -dist), radius: 0.3, half_height: 0.9, eye: 0.6, facing: facing.normalize() }];
+        let ev = run(&mut c, &w, 0.1, |t, _| Input { takedown_pressed: t == 0.0, ..Default::default() });
+        ev.iter().find_map(|e| if let Event::Takedown { anim, .. } = *e { Some(anim) } else { None })
+    };
+    assert_eq!(at(5.0, Vec3::Z), None, "5 m off: out of reach");
+    assert_eq!(at(1.5, Vec3::new(1.0, 0.0, -0.2)), Some(3), "sideways, a little away: from behind");
+    assert!(at(1.5, Vec3::new(1.0, 0.0, 0.2)).is_some_and(|a| a < 3), "sideways, a little towards her: from the front");
+}

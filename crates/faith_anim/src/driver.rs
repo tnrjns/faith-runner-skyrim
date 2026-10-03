@@ -26,17 +26,25 @@ struct WalkState {
     fwd: &'static str,
     stiff: &'static str,
     bwd: &'static str,
-    /// Ground speed the cycle was authored for (m/s); playback scales to it.
+    /// The cycles' TdAnimNodeSequence.BaseSpeed (m/s): played at speed / it (ScalePlayRateBySpeed),
+    /// held within RateMin..RateMax.
     authored: f32,
+    rate_min: f32,
+    rate_max: f32,
 }
 
+/// AT_C1P's WalkingState. `blend`: TdAnimNodeState.SetActiveMove (0x1210870) blends to a state
+/// over max(BlendWeight[new], BlendOutWeight[old]); this node has no BlendOutWeights, so the
+/// latter is the 0.2 default: max(BlendWeight, 0.2) (BlendWeight 0.15, 0.1, 0.35, 0.3, 0.6, 0.8).
+/// The cycles' BaseSpeed / RateMin / RateMax are their AnimNodeSequences' (walk 200, run 500,
+/// sprint 600 uu/s; 0.2..1.4, the sprint 0.6..1.4).
 const WALK_STATES: [WalkState; 6] = [
-    WalkState { min_speed: 0.0, blend: 0.15, fwd: "Stand", stiff: "Stand", bwd: "Stand", authored: 0.0 },
-    WalkState { min_speed: 0.05, blend: 0.1, fwd: "sneakfwd", stiff: "sneakfwd", bwd: "sneakbwd", authored: 0.5 },
-    WalkState { min_speed: 0.5, blend: 0.35, fwd: "walkfwd", stiff: "walkfwdstiff", bwd: "walkbwd", authored: 1.6 },
-    WalkState { min_speed: 2.6, blend: 0.3, fwd: "runfwd", stiff: "runfwdstiff", bwd: "runbwd", authored: 4.0 },
-    WalkState { min_speed: 4.0, blend: 0.6, fwd: "runfwd", stiff: "runfwdstiff", bwd: "runbwd", authored: 4.0 },
-    WalkState { min_speed: 6.3, blend: 0.8, fwd: "SprintFwd", stiff: "SprintFwd", bwd: "runbwd", authored: 6.3 },
+    WalkState { min_speed: 0.0, blend: 0.2, fwd: "Stand", stiff: "Stand", bwd: "Stand", authored: 0.0, rate_min: 1.0, rate_max: 1.0 },
+    WalkState { min_speed: 0.05, blend: 0.2, fwd: "sneakfwd", stiff: "sneakfwd", bwd: "sneakbwd", authored: 0.5, rate_min: 0.2, rate_max: 1.4 },
+    WalkState { min_speed: 0.5, blend: 0.35, fwd: "walkfwd", stiff: "walkfwdstiff", bwd: "walkbwd", authored: 2.0, rate_min: 0.2, rate_max: 1.4 },
+    WalkState { min_speed: 2.6, blend: 0.3, fwd: "runfwd", stiff: "runfwdstiff", bwd: "runbwd", authored: 5.0, rate_min: 0.2, rate_max: 1.4 },
+    WalkState { min_speed: 4.0, blend: 0.6, fwd: "runfwd", stiff: "runfwdstiff", bwd: "runbwd", authored: 5.0, rate_min: 0.2, rate_max: 1.4 },
+    WalkState { min_speed: 6.3, blend: 0.8, fwd: "SprintFwd", stiff: "SprintFwd", bwd: "runbwd", authored: 6.0, rate_min: 0.6, rate_max: 1.4 },
 ];
 
 /// The walk cycles share one phase (synch group "Walk"); backward cycles sit
@@ -52,6 +60,8 @@ struct LocoCycle {
     fade_in: f32,
     sync: f32,
     authored: f32,
+    rate_min: f32,
+    rate_max: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -101,10 +111,14 @@ pub struct Driver {
     oneshot: Option<OneShot>,
     /// Blend-in for the next animation after a one-shot ends.
     pending_blend: Option<f32>,
+    /// WallRunVertical's rate for the current wallclimb (TdMove_WallClimb.ReachedWall).
+    wallclimb_rate: f32,
     clock: f32,
     prev_state: Option<MoveState>,
     air_clip: &'static str,
     last_wall_side: f32,
+    /// The hand the last attack was thrown with (its follow-through uses the same).
+    melee_left: bool,
     /// Which sequences carry body travel (see [`is_travel`]).
     travel: HashMap<String, bool>,
     cam_bone: usize,
@@ -284,16 +298,18 @@ impl Driver {
             layers: vec![Layer { key: "loco".into(), src: Source::Loco, weight: 1.0, fade_in: 0.0, dying: false, last: 0.0 }],
             loco_phase: 0.0,
             walk_state: 0,
-            loco: vec![LocoCycle { seq: "Stand", weight: 1.0, fade_in: 0.15, sync: 0.0, authored: 0.0 }],
+            loco: vec![LocoCycle { seq: "Stand", weight: 1.0, fade_in: 0.2, sync: 0.0, authored: 0.0, rate_min: 1.0, rate_max: 1.0 }],
             fired: vec![],
             idle_time: 0.0,
             speed: 0.0,
             oneshot: None,
             pending_blend: None,
+            wallclimb_rate: 1.0,
             clock: 0.0,
             prev_state: None,
             air_clip: "jumpair",
             last_wall_side: 1.0,
+            melee_left: false,
             travel: HashMap::new(),
             cam_bone,
             rest_cam,
@@ -409,27 +425,48 @@ impl Driver {
         }
     }
 
-    /// A one-shot followed by another (melee wind-up, then the swing).
-    fn oneshot_then(&mut self, seq: &'static str, then: &'static str, arms: &FaithArms, blend: f32) {
-        self.oneshot(seq, arms, None, blend);
-        if let Some(o) = &mut self.oneshot {
-            o.then = Some(then);
+    /// A one-shot played at `rate` (PlayMoveAnim's rate), blending in over `blend` and out over
+    /// `out`.
+    fn oneshot_rate(&mut self, seq: &'static str, arms: &FaithArms, rate: f32, blend: f32, out: f32) {
+        let len = Self::length(arms, seq).unwrap_or(0.5) / rate;
+        self.oneshot = Some(OneShot { key: seq, until: self.clock + len, then: None, blend_out: out });
+        let key = format!("{seq}#{}", self.clock);
+        self.want(&key, Source::Play { seq, time: 0.0, rate, looping: false }, blend);
+    }
+
+    /// An attack's wind-up (each move's TriggerMove: PlayMoveAnim(clip, rate, blend in, out)).
+    fn melee(&mut self, kind: MeleeKind, left: bool, c: &Controller, arms: &FaithArms) {
+        self.melee_left = left;
+        let lr = |l: &'static str, r: &'static str| if left { l } else { r };
+        match kind {
+            MeleeKind::Punch => self.oneshot_rate(lr("MeleeStartLeft", "MeleeStartRight"), arms, 1.5, 0.1, 0.1),
+            MeleeKind::Crouch => self.oneshot_rate("MeleeCrouchStart", arms, 1.0, 0.1, 0.1),
+            MeleeKind::AirKick => match c.melee.map_or(0, |m| m.air_type) {
+                0 => self.oneshot_rate("MeleeInAir", arms, 1.0, 0.1, 0.2),
+                1 => self.oneshot_rate("MeleeInAirStill", arms, 1.0, 0.1, 0.2),
+                _ => self.oneshot_rate("MeleeFromAbove", arms, 1.0, 0.1, 0.1),
+            },
+            MeleeKind::SlideKick => self.oneshot_rate("MeleeSlide", arms, 1.0, 0.1, 0.1),
+            MeleeKind::WallRunKick => self.oneshot_rate(lr("MeleeWallRunLeft", "MeleeWallRunRight"), arms, 1.0, 0.1, 0.2),
         }
     }
 
-    fn melee(&mut self, kind: MeleeKind, left: bool, arms: &FaithArms) {
+    /// The follow-through (TriggerHit / TriggerMiss).
+    fn melee_outcome(&mut self, kind: MeleeKind, hit: bool, c: &Controller, arms: &FaithArms) {
+        let left = self.melee_left;
         let lr = |l: &'static str, r: &'static str| if left { l } else { r };
-        match kind {
-            // TdMove_Melee: BlendInMissed 0.08
-            MeleeKind::Punch => self.oneshot_then(lr("MeleeStartLeft", "MeleeStartRight"), lr("MeleeMissedLeft", "MeleeMissedRight"), arms, 0.08),
-            MeleeKind::RunKick => self.oneshot_then(lr("MeleeStart2Left", "MeleeStart2Right"), lr("MeleeMissed2Left", "MeleeMissed2Right"), arms, 0.08),
-            MeleeKind::AirKick => self.oneshot("MeleeInAir", arms, None, 0.08),
-            MeleeKind::SlideKick => self.oneshot("MeleeSlide", arms, None, 0.08),
-            MeleeKind::WallRunKick => {
-                let seq = if self.last_wall_side > 0.0 { "MeleeWallRunRight" } else { "MeleeWallRunLeft" };
-                self.oneshot(seq, arms, None, 0.08);
-            }
-            MeleeKind::Uppercut => self.oneshot_then("MeleeCrouchStartUpperCut", "MeleeCrouchHitUppercut", arms, 0.08),
+        // Another punch queued (ComboQueuedActions > 0): it blends out slower, into that one.
+        let queued = c.melee.is_some_and(|m| m.queued > 0);
+        match (kind, hit) {
+            // TdMove_Melee: hits at 1.5 x (blend 0.2 / 0.1, 0.3 with a punch queued); misses
+            // BlendInMissed 0.08, BlendOutMissed 0.1 (0.6 queued).
+            (MeleeKind::Punch, true) => self.oneshot_rate(lr("MeleeHitLeft", "MeleeHitRight"), arms, 1.5, 0.2, if queued { 0.3 } else { 0.1 }),
+            (MeleeKind::Punch, false) => self.oneshot_rate(lr("MeleeMissedLeft", "MeleeMissedRight"), arms, 1.5, 0.08, if queued { 0.6 } else { 0.1 }),
+            // TdMove_MeleeCrouch: MeleeCrouchHit either way (0.1 / 0.2).
+            (MeleeKind::Crouch, _) => self.oneshot_rate("MeleeCrouchHit", arms, 1.0, 0.1, 0.2),
+            // TdMove_MeleeAir.TriggerDamage: MeleeInAirHit (0.1 / 0.2).
+            (MeleeKind::AirKick, true) => self.oneshot_rate("MeleeInAirHit", arms, 1.0, 0.1, 0.2),
+            _ => {}
         }
     }
 
@@ -476,8 +513,9 @@ impl Driver {
         }
         let seq = Self::IDLES[self.next_idle % Self::IDLES.len()];
         self.next_idle += 1;
-        self.oneshot(seq, arms, None, 0.3);
-        self.set_blend_out(0.3);
+        // As TdMove_Walking plays its own idles: PlayMoveAnim(..., 0.4, 0.4).
+        self.oneshot(seq, arms, None, 0.4);
+        self.set_blend_out(0.4);
         true
     }
 
@@ -512,7 +550,10 @@ impl Driver {
         // (OnIdleTimer -> PlayIdle: a random UnarmedIdleAnims entry).
         let view_moved = (c.yaw - self.last_view.0).abs() > Self::VIEW_STILL || (c.pitch - self.last_view.1).abs() > Self::VIEW_STILL;
         self.last_view = (c.yaw, c.pitch);
-        let still = c.state == MoveState::Ground && !c.crouched && raw_speed <= 0.3 && !view_moved && c.events.is_empty();
+        // Looking round doesn't count here (only moving does): an idle plays, and keeps
+        // playing, while the mouse moves.
+        let _ = view_moved;
+        let still = c.state == MoveState::Ground && !c.crouched && raw_speed <= 0.3 && c.events.is_empty();
         if !still {
             self.idle_timer = self.new_idle_time();
         } else {
@@ -536,8 +577,13 @@ impl Driver {
         // ---- events â†’ one-shots
         for e in &c.events {
             match *e {
+                // TdMove_Jump: by her speed along her facing, JumpStill under 5 uu/s (in 0.15),
+                // JumpSlow under LongJumpNormalThreshold (500 uu/s), else JumpFast (in 0.1).
+                // (Past 500 the game plays JumpSlow too when its trace finds ground under where
+                // she'll land; that prediction isn't made here.)
                 MoveEvent::Jump => {
-                    self.air_clip = if speed > 5.0 { "jumpfast" } else { "JumpSlow" };
+                    let along = Vec3::new(c.vel.x, 0.0, c.vel.z).dot(fwd);
+                    self.air_clip = if along < 0.05 { "jumpstill" } else if along < 5.0 { "JumpSlow" } else { "jumpfast" };
                 }
                 // TdMove_Landing.LandNormal, then straight back to walking (EndLanding): see LandFx.
                 MoveEvent::Land { fall, .. } if matches!(c.state, MoveState::Ground) => {
@@ -556,13 +602,20 @@ impl Driver {
                     self.oneshot("Taunt", arms, None, 0.1);
                     self.set_blend_out(0.2);
                 }
-                MoveEvent::Dodge { dir } | MoveEvent::WallRunDodge { dir } => {
+                // TdMove_DodgeJump: dodgejumpleft/right (JumpBlendInTime 0.1, out 0.2).
+                MoveEvent::Dodge { dir } => {
                     let seq = if dir.dot(right) < 0.0 { "dodgejumpleft" } else { "dodgejumpright" };
-                    self.oneshot(seq, arms, None, 0.1);
+                    self.oneshot_rate(seq, arms, 1.0, 0.1, 0.2);
                 }
-                MoveEvent::WallClimbDodge { dir } => {
-                    let seq = if dir.dot(right) < 0.0 { "wallrunverticaldodgeleft" } else { "wallrunverticaldodgeright" };
-                    self.oneshot(seq, arms, None, 0.06);
+                // TdMove_WallrunDodgeJump: the same clips, 0.2 / 0.2.
+                MoveEvent::WallRunDodge { dir } => {
+                    let seq = if dir.dot(right) < 0.0 { "dodgejumpleft" } else { "dodgejumpright" };
+                    self.oneshot_rate(seq, arms, 1.0, 0.2, 0.2);
+                }
+                // TdMove_WallClimbDodgeJump: JumpSlow (JumpBlendInTime / OutTime 0.2 / 0.2).
+                MoveEvent::WallClimbDodge { .. } => {
+                    self.air_clip = "JumpSlow";
+                    self.oneshot_rate("JumpSlow", arms, 1.0, 0.2, 0.2);
                 }
                 // TdMove_WallrunJump.StartMove: WallrunJumpLeft/Right (blend 0.2) only when you jump
                 // looking out from the wall (PushSpeed > 0.6; after Q it's 1), else JumpSlow.
@@ -571,12 +624,13 @@ impl Driver {
                         Some(MoveState::WallRun { normal, .. }) => fwd.dot(normal),
                         _ => 1.0,
                     };
+                    // PlayMoveAnim(3, ..., 1.0, 0.2, 0.2): the whole clip (landing ends it).
                     if push > 0.6 {
                         let seq = if self.last_wall_side < 0.0 { "WallrunJumpLeft" } else { "wallrunjumpright" };
-                        self.oneshot(seq, arms, Some(0.7), 0.2);
+                        self.oneshot_rate(seq, arms, 1.0, 0.2, 0.2);
                     } else {
                         self.air_clip = "JumpSlow";
-                        self.oneshot("JumpSlow", arms, Some(0.7), 0.2);
+                        self.oneshot_rate("JumpSlow", arms, 1.0, 0.2, 0.2);
                     }
                 }
                 MoveEvent::WallKick => match prev {
@@ -598,10 +652,10 @@ impl Driver {
                         }
                     }
                     // TdMove_GrabJump: HangTurnJump (blend 0.2).
-                    _ => self.oneshot("HangTurnJump", arms, None, 0.2),
+                    _ => self.oneshot("hangturnjump", arms, None, 0.2),
                 },
                 // TdMove_180TurnInAir.StartMove: PlayMoveAnim JumpTurnFly, blend 0.1.
-                MoveEvent::Turn180 if c.state == MoveState::Air => self.oneshot("JumpTurnFly", arms, None, 0.1),
+                MoveEvent::Turn180 if c.state == MoveState::Air => self.oneshot_rate("JumpTurnFly", arms, 1.0, 0.1, 0.1),
                 // TdMove_180Turn.StartMove: RunTurn180 moving, StandTurn180Right standing
                 // (TurnAnimBlendInTime / OutTime 0.2).
                 MoveEvent::Turn180 if c.state == MoveState::Ground => {
@@ -611,30 +665,74 @@ impl Driver {
                 }
                 // TdMove_Swing's turn: Swing180 (blend 0.2, out 0.3).
                 MoveEvent::Turn180 if matches!(c.state, MoveState::Swing { .. }) => {
-                    self.oneshot("Swing180", arms, None, 0.2);
+                    self.oneshot("swing180", arms, None, 0.2);
                     self.set_blend_out(0.3);
                 }
-                // TdMove_Grab.AnimBlendTime = 0.1
-                MoveEvent::LedgeGrab => self.oneshot("HangHardStart", arms, Some(0.55), 0.1),
+                // TdMove_IntoGrab.ReachedPreciseLocation, by the speed she came down at
+                // (IntoGrabSpeed): faster than HangHardImpactMinZSpeed (-1000 uu/s)
+                // HangHardStart3 with the gethitfront camera jolt, faster than
+                // HangImpactMinZSpeed (-600) HangHardStart2, else HangHardStart; 1.0, in 0.1,
+                // out 0.2, the whole clip (leaving the hang ends it).
+                MoveEvent::LedgeGrab => {
+                    let v = c.grab_speed;
+                    let seq = if v < -10.0 { "HangHardStart3" } else if v < -6.0 { "HangHardStart2" } else { "HangHardStart" };
+                    self.oneshot_rate(seq, arms, 1.0, 0.1, 0.2);
+                    if v < -10.0 {
+                        self.cam_clip = Some(("gethitfront", 0.0, 0.05, 0.2));
+                    }
+                }
                 MoveEvent::Death => {
                     self.oneshot = None;
                     self.want("loco", Source::Loco, 0.01);
                 }
+                // TdMove_SpringBoard: SpringBoardRightLeg if her left leg is forward
+                // (IsLeftLegForward: the walk synch master past half its cycle), else
+                // SpringBoardLeftLeg; 1.0, in 0.15, out 0.25.
                 MoveEvent::SpringBoard => {
-                    self.oneshot("SpringBoardLeftLeg", arms, Some(1.1), 0.1);
-                    self.set_blend_out(0.4);
+                    let seq = if self.left_leg_forward() { "SpringBoardRightLeg" } else { "SpringBoardLeftLeg" };
+                    self.oneshot_rate(seq, arms, 1.0, 0.15, 0.25);
                 }
                 MoveEvent::BalanceFall => {
                     let lean = if let MoveState::Balance { lean, .. } = prev.unwrap_or(c.state) { lean } else { 0.0 };
                     let seq = if lean < 0.0 { "walkbalancefalloffleft" } else { "walkbalancefalloffright" };
-                    self.oneshot(seq, arms, None, 0.1);
+                    // TdMove_Balance: 1.0, in 0.3, out 0.3.
+                    self.oneshot_rate(seq, arms, 1.0, 0.3, 0.3);
                 }
-                MoveEvent::ZipStart => self.oneshot("ziplinestart", arms, None, 0.3),
-                MoveEvent::ZipEnd { hit_wall: true } => self.oneshot("ziplinehitwall", arms, None, 0.1),
+                // TdMove_IntoZipLine: PlayMoveAnim(ZiplineStart, 0.3 / time to the line, in 0.2,
+                // out 0.4).
+                MoveEvent::ZipStart => self.oneshot_rate("ziplinestart", arms, c.zip_start_rate, 0.2, 0.4),
+                // PrepareForForwardImpact: StopCustomAnim(0.1), then ziplineintohitwall looping
+                // (the state's own animation below, blend in 0.3).
+                MoveEvent::ZipBrace => {
+                    if self.oneshot.as_ref().is_some_and(|o| o.key.starts_with("zipline")) {
+                        self.oneshot = None;
+                        self.pending_blend = Some(0.1);
+                    }
+                }
+                // PlayForwardImpact: ziplinehitwall (in 0.1, out 0.2).
+                MoveEvent::ZipEnd { hit_wall: true } => {
+                    self.oneshot("ziplinehitwall", arms, None, 0.1);
+                    self.set_blend_out(0.2);
+                }
+                // TdMove_ZipLine.StopMove otherwise: SwingJumpOff (in 0.2, out 0.2).
+                MoveEvent::ZipEnd { hit_wall: false } => self.oneshot_rate("swingjumpoff", arms, 1.0, 0.2, 0.2),
+                // TdMove_Barge: MeleeKickObject standing (in 0.1, out 0.1), played to its end.
+                MoveEvent::Barge { hands: false } => self.oneshot_rate("meleekickobject", arms, 1.0, 0.1, 0.1),
+                // The door gives: BargeOutLeft (in 0, out 0.2), played to its end.
+                MoveEvent::DoorOpened { .. } if matches!(c.state, MoveState::Barge { hands: true, .. }) || matches!(prev, Some(MoveState::Barge { hands: true, .. })) => {
+                    self.oneshot_rate("bargeoutleft", arms, 1.0, 0.0, 0.2)
+                }
                 // TdMove_Swing.AnimBlendTime = 0.15
                 MoveEvent::SwingStart => self.oneshot("swinghardstart", arms, None, 0.15),
-                MoveEvent::SwingJump => self.oneshot("swingjumpoff", arms, Some(0.6), 0.1),
-                MoveEvent::Melee { kind, left } => self.melee(kind, left, arms),
+                // TdMove_Swing.JumpOff: SwingJumpOff (1.0, in 0.2, out 0.2).
+                MoveEvent::SwingJump => self.oneshot_rate("swingjumpoff", arms, 1.0, 0.2, 0.2),
+                MoveEvent::Melee { kind, left } => self.melee(kind, left, c, arms),
+                // TdMOVE_Disarm.PlayDisarmStart: PlayMoveAnim(DisarmAnim, 1.0, in 0.1, out 0.2).
+                MoveEvent::Takedown { anim, .. } => {
+                    let seq = faith_move::TAKEDOWN_ANIMS[(anim as usize).min(3)];
+                    self.oneshot_rate(seq, arms, 1.0, 0.1, 0.2);
+                }
+                MoveEvent::MeleeOutcome { kind, hit } => self.melee_outcome(kind, hit, c, arms),
                 _ => {}
             }
         }
@@ -657,12 +755,23 @@ impl Driver {
                 // TdMove_WallRun.ReachedWall (PlayCameraHitWallEffect): the camera-channel jolt.
                 let seq = if self.last_wall_side > 0.0 { "wallrunimpactright" } else { "wallrunimpactleft" };
                 self.cam_clip = Some((seq, 0.0, 0.15, 0.15));
+                // WallRunningIntoWallrunBlendInTime / OutTime 0.2 / 0.2, at
+                // WallrunStartUpperBodyAnimPlayRate (0.6) with wall above her head, else 1.
                 let seq = if self.last_wall_side > 0.0 { "wallrunrightstart" } else { "wallrunleftstart" };
-                self.oneshot(seq, arms, None, 0.12);
+                let rate = if c.wallrun_wall_above { 0.6 } else { 1.0 };
+                self.oneshot_rate(seq, arms, rate, 0.2, 0.2);
             }
         }
         if entered(|s| matches!(s, MoveState::WallClimb { .. })) {
-            self.oneshot("wallrunverticalstart", arms, None, 0.1);
+            // TdMove_WallClimb.ReachedWall: WallRunVertical's rate is 0.4 over the time to the
+            // top of the climb (the vertical speed over twice WallClimbingGravity, as the game
+            // has it), 0.1..1.
+            let to_top = (c.vel.y / (2.0 * c.tuning.wallclimb_gravity)).max(1e-3);
+            self.wallclimb_rate = (0.4 / to_top).clamp(0.1, 1.0);
+        }
+        // TdMove_WallClimb.StopMove: StopCustomAnim(0.25).
+        if matches!(prev, Some(MoveState::WallClimb { .. })) && !matches!(c.state, MoveState::WallClimb { .. }) {
+            self.pending_blend = Some(self.pending_blend.unwrap_or(0.0).max(0.25));
         }
         self.update_hang_turn(c, arms);
         self.update_stand_turn(c, arms, raw_speed, dt);
@@ -684,17 +793,19 @@ impl Driver {
                 MoveState::Traverse(tr) => tr.kind == TraverseKind::SpringBoard && o.key.starts_with("SpringBoard"),
                 MoveState::Swing { .. } => o.key.starts_with("swing"),
                 MoveState::ZipLine { .. } => o.key.starts_with("zipline"),
+                MoveState::Barge { .. } => o.key == "meleekickobject" || o.key == "bargeoutleft",
+                MoveState::Takedown { .. } => o.key.starts_with("Snatch"),
                 _ => false,
             };
             // A standing landing gives way as soon as you run off; so does an idle.
             let idle = Self::IDLES.iter().any(|i| *i == o.key);
             let run_off = (o.key == "JumpLand" && raw_speed > 2.6)
-                || (idle && (raw_speed > 0.3 || c.state != MoveState::Ground || c.crouched || view_moved));
+                || (idle && (raw_speed > 0.3 || c.state != MoveState::Ground || c.crouched));
             // A jump's own clip (dodge, wall jump-off, kick-off, springboard) belongs to that
             // jump: touching down ends it, blending out over the move's JumpBlendOutTime (0.2).
             // The dodge clips run 0.83 s against ~0.4 s in the air, so without this the dodge
             // pose would hang on over the run cycle.
-            let air_clip = ["dodgejump", "wallrunverticaldodge", "wallrunjump", "JumpSlow", "JumpTurnFly", "swingjumpoff", "MeleeInAir", "SpringBoard"]
+            let air_clip = ["dodgejump", "wallrunjump", "JumpSlow", "JumpTurnFly", "swingjumpoff", "MeleeInAir", "MeleeFromAbove", "SpringBoard"]
                 .iter()
                 .any(|k| o.key.to_ascii_lowercase().starts_with(&k.to_ascii_lowercase()));
             let touched_down = prev.is_some_and(|p| matches!(p, MoveState::Air))
@@ -740,12 +851,14 @@ impl Driver {
                         let seq = if c.vel.y < -9.0 { "fallinguncontrolledbwd" } else { "jumpturnflyend" };
                         self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: true }, if c.vel.y < -9.0 { 0.3 } else { 0.1 });
                     } else if c.is_coiled() {
-                        self.want("jumpcoil", Source::Play { seq: "jumpcoil", time: 0.0, rate: 1.0, looping: false }, 0.1);
+                        // TdMove_Coil: JumpCoil (1.0, in 0.15).
+                        self.want("jumpcoil", Source::Play { seq: "jumpcoil", time: 0.0, rate: 1.0, looping: false }, 0.15);
                     } else if c.vel.y < -9.0 {
                         self.want("fallinguncontrolled", Source::Play { seq: "fallinguncontrolled", time: 0.0, rate: 1.0, looping: true }, 0.3);
                     } else {
                         let seq = self.air_clip;
-                        self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: false }, 0.1);
+                        let blend = if seq == "jumpstill" { 0.15 } else { 0.1 };
+                        self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: false }, blend);
                     }
                 }
                 MoveState::WallRun { .. } => {
@@ -753,8 +866,10 @@ impl Driver {
                     let rate = (speed / 6.3).clamp(0.7, 1.3);
                     self.want(seq, Source::Play { seq, time: 0.0, rate, looping: true }, 0.15);
                 }
+                // TdMove_WallClimb.StartMove: PlayCustomAnim(WallRunVertical, looping, in 0.2).
                 MoveState::WallClimb { .. } => {
-                    self.want("WallRunVertical", Source::Play { seq: "WallRunVertical", time: 0.0, rate: 1.0, looping: true }, 0.1);
+                    let rate = self.wallclimb_rate;
+                    self.want("WallRunVertical", Source::Play { seq: "WallRunVertical", time: 0.0, rate, looping: true }, 0.2);
                 }
                 MoveState::WallClimbTurned { .. } => {
                     self.want("wallrunvertical180turn", Source::Play { seq: "wallrunvertical180turn", time: 0.0, rate: 1.0, looping: false }, 0.1);
@@ -798,15 +913,14 @@ impl Driver {
                 },
                 // TdMove_Barge: BargeInLeft (blend 0.2) running at it, then BargeOutLeft once it
                 // gives; standing, MeleeKickObject (blend 0.1).
-                MoveState::Barge { t, hands: true, hit, .. } => {
-                    let seq = if hit { "bargeoutleft" } else { "bargeinleft" };
-                    let blend = if hit { 0.0 } else { 0.2 };
-                    self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: false }, blend);
-                    let _ = t;
+                MoveState::Barge { hands: true, rate, .. } => {
+                    self.want("bargeinleft", Source::Play { seq: "bargeinleft", time: 0.0, rate, looping: false }, 0.2);
                 }
                 MoveState::Barge { t, .. } => {
                     self.want("meleekickobject", Source::Driven { seq: "meleekickobject", time: t }, 0.1);
                 }
+                // Its clip is a one-shot (the event); without one, standing.
+                MoveState::Takedown { .. } => self.want("loco", Source::Loco, 0.2),
                 // TdMove_Stumble.PlayStumbleAnimation: StumbleFwd (blend 0.3), or GetHitStumbleBwd
                 // (blend 0.1).
                 MoveState::Stumble { t, forward, .. } => {
@@ -839,7 +953,8 @@ impl Driver {
                     self.want("CrouchSlide", Source::Driven { seq: "CrouchSlide", time: t }, 0.4);
                 }
                 MoveState::Roll { t } => {
-                    self.want("fallinglandroll", Source::Driven { seq: "fallinglandroll", time: t }, 0.06);
+                    // TdMove_SkillRoll: fallinglandroll (1.0, in 0.2).
+                    self.want("fallinglandroll", Source::Driven { seq: "fallinglandroll", time: t }, 0.2);
                 }
                 MoveState::Stunned { .. } => {
                     self.want("fallinglandhard", Source::Play { seq: "fallinglandhard", time: 0.0, rate: 1.0, looping: false }, 0.05);
@@ -868,8 +983,13 @@ impl Driver {
                     let key = format!("balance-{base}-{b}");
                     self.want(&key, Source::Blend2 { a: base, b, time: 0.0, rate, k: lean.abs() }, 0.4);
                 }
+                MoveState::ZipLine { .. } if c.zip_braced => {
+                    self.want("ziplineintohitwall", Source::Play { seq: "ziplineintohitwall", time: 0.0, rate: 1.0, looping: true }, 0.3);
+                }
                 MoveState::ZipLine { .. } => {
-                    self.want("ZipLine", Source::Play { seq: "ZipLine", time: 0.0, rate: 1.0, looping: true }, 0.2);
+                    // The loop's two leg positions: from the left it starts on the second.
+                    let time = if c.zip_from_left { Self::length(arms, "ZipLine").unwrap_or(0.0) * 0.5 } else { 0.0 };
+                    self.want("ZipLine", Source::Play { seq: "ZipLine", time, rate: 1.0, looping: true }, 0.2);
                 }
                 MoveState::Swing { angle, .. } => {
                     let (b, key) = if angle < 0.0 { ("swingposebacktop", "swing-back") } else { ("swingposefronttop", "swing-front") };
@@ -913,8 +1033,10 @@ impl Driver {
                 self.land = None;
             }
         }
-        self.update_walk_state(dt, c, speed);
-        let loco_rate = self.loco_cycles_per_sec(arms, speed);
+        // ATdPawn::UpdateWalkingState and ScalePlayRateBySpeed both read the pawn's own velocity
+        // (not a smoothed one): the walk gives way the moment she slows.
+        self.update_walk_state(dt, c, raw_speed);
+        let loco_rate = self.loco_cycles_per_sec(arms, raw_speed);
         self.loco_phase = (self.loco_phase + dt * loco_rate).fract();
         let n = self.layers.len();
         for (i, l) in self.layers.iter_mut().enumerate() {
@@ -953,7 +1075,12 @@ impl Driver {
                     (loco_name.map(|(n, _)| n), (self.loco_phase + sync).fract() * len, true)
                 }
             };
-            if l.weight >= 0.5 {
+            // A clip that's just been played fires its notifies from its first frame, even as it
+            // fades in (AnimNodeSequence.NotifyWeightThreshold 0: an attack's swoosh is at
+            // 0.001 s); the walk cycles, and anything fading out, only while they're mostly
+            // what you see (so two blended cycles don't both step).
+            let fresh = !l.dying && !matches!(l.src, Source::Loco);
+            if l.weight >= 0.5 || fresh {
                 if let Some(s) = seq.and_then(|n| arms.anims.sequences.get(n)) {
                     crossed(s, l.last, now, looping, &mut fired);
                 }
@@ -1283,18 +1410,11 @@ impl Driver {
         }
     }
 
-    /// Pick the walking state from speed (with ME's 5% hysteresis on the way
-    /// down, TdAnimNodeBlendBySpeed.BlendDownPerc) and direction, and
-    /// crossfade the cycles.
+    /// Pick the walking state from speed (ATdPawn::UpdateWalkingState, 0x12b1660: the 2D speed
+    /// against Sneak/Walk/Jog/Run/SprintVelocity, no hysteresis) and direction, and crossfade
+    /// the cycles.
     fn update_walk_state(&mut self, dt: f32, c: &Controller, speed: f32) {
-        let up = WALK_STATES.iter().rposition(|w| speed >= w.min_speed).unwrap_or(0);
-        let cur = self.walk_state;
-        let state = if up >= cur {
-            up
-        } else {
-            // Only drop a state once clearly below its threshold.
-            WALK_STATES.iter().rposition(|w| speed >= w.min_speed * 1.05).unwrap_or(0).min(cur)
-        };
+        let state = WALK_STATES.iter().rposition(|w| speed >= w.min_speed).unwrap_or(0);
         self.walk_state = state;
         let ws = &WALK_STATES[state];
         let fwd = c.forward();
@@ -1308,7 +1428,7 @@ impl Driver {
             (ws.fwd, SYNC_FWD)
         };
         if self.loco.last().is_none_or(|l| l.seq != seq) {
-            self.loco.push(LocoCycle { seq, weight: 0.0, fade_in: ws.blend.max(1e-3), sync, authored: ws.authored });
+            self.loco.push(LocoCycle { seq, weight: 0.0, fade_in: ws.blend.max(1e-3), sync, authored: ws.authored, rate_min: ws.rate_min, rate_max: ws.rate_max });
         }
         let n = self.loco.len();
         if let Some(top) = self.loco.last_mut() {
@@ -1326,20 +1446,20 @@ impl Driver {
         self.loco.retain(|l| l.weight > 1e-3);
     }
 
+    /// TdPawn.IsLeftLegForward: the Walk synch group's master past half its cycle.
+    fn left_leg_forward(&self) -> bool {
+        let master = self.loco.iter().filter(|l| l.authored > 0.0).max_by(|a, b| a.weight.total_cmp(&b.weight));
+        master.is_some_and(|l| (self.loco_phase + l.sync).fract() > 0.5)
+    }
+
+    /// The "Walk" synch group's pace (AnimNodeSynch): its master, the cycle with the most
+    /// weight, plays at speed / BaseSpeed within its RateMin..RateMax, and the rest follow its
+    /// relative position. Standing isn't in the group.
     fn loco_cycles_per_sec(&self, arms: &FaithArms, speed: f32) -> f32 {
-        let mut rate = 0.0;
-        let mut moving = 0.0;
-        for l in &self.loco {
-            if l.authored <= 0.0 {
-                continue;
-            }
-            if let Some(seq) = arms.anims.sequences.get(l.seq) {
-                let play = (speed / l.authored).clamp(0.6, 1.5);
-                rate += l.weight * play / seq.length.max(0.1);
-                moving += l.weight;
-            }
-        }
-        if moving > 1e-3 { rate / moving } else { 0.0 }
+        let master = self.loco.iter().filter(|l| l.authored > 0.0).max_by(|a, b| a.weight.total_cmp(&b.weight));
+        let Some(l) = master else { return 0.0 };
+        let Some(seq) = arms.anims.sequences.get(l.seq) else { return 0.0 };
+        (speed / l.authored).clamp(l.rate_min, l.rate_max) / seq.length.max(0.1)
     }
 
     /// Sample one layer; also says whether it's a travel animation.
@@ -1630,7 +1750,8 @@ mod tests {
             return;
         }
         let mut jumped = false;
-        let log = run(2, 4.0, |c| {
+        // Long enough for HangHardStart to play out (TdMove_IntoGrab plays it whole).
+        let log = run(2, 6.0, |c| {
             if matches!(c.state, MoveState::WallClimb { .. } | MoveState::LedgeHang { .. }) {
                 return Input::default();
             }

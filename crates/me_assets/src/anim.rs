@@ -68,30 +68,53 @@ fn w_from_xyz(x: f32, y: f32, z: f32) -> f32 {
 }
 
 impl AnimSet {
+    /// The package's (first) AnimSet, with every sequence in the package.
     pub fn read(pkg: &Package) -> Result<Self> {
         let set = pkg
             .exports
             .iter()
             .find(|e| matches!(pkg.class_name(e), "AnimSet" | "TdAnimSet"))
             .ok_or_else(|| Error::Missing("AnimSet".into()))?;
+        Self::read_set(pkg, set, false)
+    }
+
+    /// The AnimSet called `name`, with only its own sequences (a package can hold several sets,
+    /// each with its own track order).
+    pub fn read_named(pkg: &Package, name: &str) -> Result<Self> {
+        let set = pkg
+            .exports
+            .iter()
+            .find(|e| matches!(pkg.class_name(e), "AnimSet" | "TdAnimSet") && e.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::Missing(format!("AnimSet {name}")))?;
+        Self::read_set(pkg, set, true)
+    }
+
+    fn read_set(pkg: &Package, set: &crate::package::Export, own: bool) -> Result<Self> {
         let props = Props::read(pkg, set)?;
+        let own_sequences: Vec<&crate::package::Export> = if own {
+            props.object_array(pkg, "Sequences").into_iter().filter(|&o| o > 0).filter_map(|o| pkg.exports.get(o as usize - 1)).collect()
+        } else {
+            pkg.of_class("AnimSequence").collect()
+        };
         let t = props.get("TrackBoneNames").ok_or_else(|| Error::Missing("TrackBoneNames".into()))?;
         let mut c = Cursor::new(&pkg.data, t.at);
         let n = c.count(8)?;
         let bones = (0..n).map(|_| read_name(&pkg.names, &mut c)).collect::<Result<Vec<_>>>()?;
 
         let mut sequences = HashMap::new();
-        for e in pkg.of_class("AnimSequence") {
+        for e in own_sequences {
             let props = Props::read(pkg, e)?;
             let name = props.name(pkg, "SequenceName").unwrap_or_else(|| e.name.clone());
             let length = props.f32(pkg, "SequenceLength").unwrap_or(0.0);
             let frames = props.i32(pkg, "NumFrames").unwrap_or(1).max(1) as u32;
             let rate = props.f32(pkg, "RateScale").unwrap_or(1.0);
-            if let Some(fmt) = props.name(pkg, "RotationCompressionFormat") {
-                if fmt != "ACF_Fixed48NoW" {
-                    return Err(Error::Format(format!("{name}: unsupported rotation format {fmt}")));
-                }
-            }
+            // Faith's own clips are ACF_Fixed48NoW; the AI's are ACF_Float96NoW too. Anything else
+            // is left out (not the whole set).
+            let float96 = match props.name(pkg, "RotationCompressionFormat").as_deref() {
+                None | Some("ACF_Fixed48NoW") => false,
+                Some("ACF_Float96NoW") => true,
+                Some(_) => continue,
+            };
             let t = props
                 .get("CompressedTrackOffsets")
                 .ok_or_else(|| Error::Missing(format!("{name}: track offsets")))?;
@@ -115,6 +138,12 @@ impl AnimSet {
                 if rk == 1 {
                     let [x, y, z] = c.vec3()?;
                     tr.rotations.push([-x * s, -y * s, -z * s, w_from_xyz(x, y, z)]);
+                } else if rk > 1 && float96 {
+                    c.skip(24)?;
+                    for _ in 0..rk {
+                        let [x, y, z] = c.vec3()?;
+                        tr.rotations.push([-x * s, -y * s, -z * s, w_from_xyz(x, y, z)]);
+                    }
                 } else if rk > 1 {
                     c.skip(24)?;
                     for _ in 0..rk {
@@ -150,5 +179,18 @@ impl AnimSet {
             sequences.insert(name.clone(), Sequence { name, length, frames, rate, tracks, notifies });
         }
         Ok(AnimSet { bones, sequences })
+    }
+
+    /// Another set's sequences (those `keep` picks, by name), its tracks put in this set's bone
+    /// order; a bone it has no track for keeps the rest pose. Ones already here stay.
+    pub fn add_from(&mut self, other: &AnimSet, keep: impl Fn(&str) -> bool) {
+        let from: Vec<Option<usize>> = self.bones.iter().map(|b| other.bones.iter().position(|o| o.eq_ignore_ascii_case(b))).collect();
+        for (name, seq) in &other.sequences {
+            if !keep(name) || self.sequences.contains_key(name) {
+                continue;
+            }
+            let tracks = from.iter().map(|i| i.and_then(|i| seq.tracks.get(i).cloned()).unwrap_or_default()).collect();
+            self.sequences.insert(name.clone(), Sequence { tracks, ..seq.clone() });
+        }
     }
 }

@@ -27,6 +27,8 @@ pub struct Input {
     pub turn_pressed: bool,
     /// Kick / punch.
     pub melee_pressed: bool,
+    /// The takedown (TdMOVE_Disarm) on whoever's in front of her.
+    pub takedown_pressed: bool,
     /// The strafe axis before the move vector is clamped (PlayerInput.aStrafe): a key is the
     /// full +-1 even with W held. 0 = take it from `move_axis`.
     pub strafe_raw: f32,
@@ -35,27 +37,50 @@ pub struct Input {
 /// Which attack: Mirror's Edge picks it from what you're doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeleeKind {
-    /// Standing punch (TdMove_Melee stand attack), alternating hands.
+    /// On the ground, standing or running (TdMove_Melee): punches, alternating hands.
     Punch,
-    /// Running kick.
-    RunKick,
     /// Jump kick (TdMove_MeleeAir).
     AirKick,
     /// Sliding kick (TdMove_MeleeSlide).
     SlideKick,
     /// Kick off a wallrun (TdMove_MeleeWallrun).
     WallRunKick,
-    /// Crouching uppercut (TdMove_MeleeCrouch).
-    Uppercut,
+    /// Crouched (TdMove_MeleeCrouch): MeleeCrouchStart, then MeleeCrouchHit.
+    Crouch,
+}
+
+/// Where an attack is (TdMove_MeleeBase.MeleeState).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeleePhase {
+    /// The wind-up (MS_MeleeAttackNormal).
+    Start,
+    /// The follow-through after a hit or a miss.
+    Hit,
+    Missed,
 }
 
 /// An attack in progress. It plays over whatever move you're in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Melee {
     pub kind: MeleeKind,
+    /// Time in the current phase.
     pub t: f32,
-    /// Left hand/foot (attacks alternate).
+    /// Left hand/foot (punches alternate). For the wallrun kick: the wall was on the left.
     pub left: bool,
+    pub phase: MeleePhase,
+    /// The target chosen at the start (`Target::id`).
+    pub target: Option<u32>,
+    /// TdMove_MeleeAir: 0 from a moving jump, 1 from a still one, 2 coming down onto them.
+    pub air_type: u8,
+    /// The limb's sweep is on (bHitDetection); it comes on after `detect_in` seconds.
+    pub detecting: bool,
+    pub detect_in: Option<f32>,
+    /// TdMove_Melee's combo: punches queued, punches counted, and how long the window stays open.
+    pub queued: i32,
+    pub combo: i32,
+    pub window: f32,
+    /// The momentum a kick lands with (TdMove_MeleeAir: the velocity at the start x 1.6).
+    pub momentum: Vec3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,7 +122,8 @@ pub enum State {
     /// TdMove_LayOnGround). `getting_up` counts up once you've asked to stand.
     LayOnGround { t: f32, getting_up: Option<f32>, back_roll: bool },
     /// Barging a door (TdMove_Barge): `hands` shoulder-first at a run, else a kick.
-    Barge { t: f32, door: usize, hands: bool, hit: bool, dir: Vec3 },
+    /// `rate`: BargeInLeft's play rate, BargeAnimTime over the time to the door (0.7..1.3).
+    Barge { t: f32, door: usize, hands: bool, hit: bool, dir: Vec3, rate: f32 },
     /// Tripped by barbed wire (TdMove_Stumble), `forward` over it or back from it.
     Stumble { t: f32, forward: bool, dir: Vec3 },
     /// Landed a big drop on something soft (TdMove_Landing.LandOnSoftObject).
@@ -113,6 +139,9 @@ pub enum State {
     /// direction, `angle` the pendulum angle from straight down (positive =
     /// swung forward) and `rate` its angular speed.
     Swing { a: Vec3, b: Vec3, at: Vec3, dir: Vec3, angle: f32, rate: f32 },
+    /// Taking someone down (TdMOVE_Disarm, `takedown`): sliding from `from` to `to`, turning to
+    /// `face`, for the clip's `len`.
+    Takedown { t: f32, len: f32, target: u32, from: Vec3, to: Vec3, face: f32 },
 }
 
 impl State {
@@ -146,6 +175,7 @@ impl State {
             State::Barge { .. } => "Kick",
             State::Stumble { .. } => "Stumble",
             State::SoftLand { .. } => "Soft landing",
+            State::Takedown { .. } => "Takedown",
         }
     }
 }
@@ -194,11 +224,25 @@ pub enum Event {
     SpringBoard,
     BalanceStart,
     BalanceFall,
+    /// A takedown started on `target` (TdMOVE_Disarm): `anim` indexes
+    /// `takedown::TAKEDOWN_ANIMS`; the host puts them at `enemy_at`, their clip placed facing
+    /// `enemy_dir` (towards her, for every takedown).
+    Takedown { target: u32, anim: u8, enemy_at: Vec3, enemy_dir: Vec3 },
+    /// The takedown's clip ended: what becomes of them is the host's call.
+    TakedownDone { target: u32 },
     ZipStart,
+    /// TdMove_ZipLine.PrepareForForwardImpact: something solid within 600 units ahead.
+    ZipBrace,
     ZipEnd { hit_wall: bool },
     SwingStart,
     SwingJump,
     Melee { kind: MeleeKind, left: bool },
+    /// The wind-up ended: the hit or the miss follows (punches, the crouch attack; the air kick
+    /// when it connects).
+    MeleeOutcome { kind: MeleeKind, hit: bool },
+    /// An attack landed on a target (`Target::id`): Mirror's Edge's damage, and the momentum
+    /// (m/s) it hits with.
+    MeleeHit { target: u32, damage: f32, momentum: Vec3, kind: MeleeKind },
     /// Melee during the air 180 (TdMove_180TurnInAir.HandleMoveAction(MA_Melee)): Taunt.
     Taunt,
 }
@@ -392,6 +436,15 @@ pub struct Controller {
     /// The attack playing right now, if any.
     pub melee: Option<Melee>,
     melee_left: bool,
+    /// Who Faith can hit (the host's actors); none in the app.
+    pub targets: Vec<crate::melee::Target>,
+    /// Where the attacking limb is (`melee_bone`), from the animation; without one it's taken
+    /// as just ahead of her.
+    pub hit_bone: Option<Vec3>,
+    pub(crate) melee_last_start: Vec3,
+    pub(crate) speed_log: std::collections::VecDeque<(f32, f32)>,
+    /// Knocked back off an air kick: no air control until she lands.
+    pub(crate) melee_no_input: bool,
     /// Lighter gravity just after leaving a swing pole.
     low_grav: f32,
     /// In TdMove_DodgeJump (see `dodge_jump`).
@@ -406,6 +459,19 @@ pub struct Controller {
     dodge_redo: f32,
     /// Can't re-grab a zipline or pole straight after letting go.
     fixture_cooldown: f32,
+    /// On a zipline: braced for the wall ahead (ZLS_CloseToEnd); whether you came onto it from
+    /// its left (the ZipLine loop then starts half way through); the ZiplineStart rate.
+    pub zip_braced: bool,
+    pub zip_from_left: bool,
+    pub zip_start_rate: f32,
+    /// Takedowns so far (which front snatch plays next).
+    pub(crate) takedowns: u32,
+    /// The wall goes on above her head where a wallrun started (TdMove_WallRun's upper-body
+    /// trace): its start clip plays at WallrunStartUpperBodyAnimPlayRate (0.6), else at 1.
+    pub wallrun_wall_above: bool,
+    /// Her vertical speed as she caught the last ledge (TdMove_IntoGrab.IntoGrabSpeed, m/s):
+    /// which grab-impact clip plays.
+    pub grab_speed: f32,
     springboard: Option<SpringRunIn>,
     /// Seconds since grabbing the current ledge.
     hang_time: f32,
@@ -413,13 +479,13 @@ pub struct Controller {
 
 const SUBSTEP: f32 = 1.0 / 120.0;
 
-fn forward(yaw: f32) -> Vec3 {
+pub(crate) fn forward(yaw: f32) -> Vec3 {
     Vec3::new(-yaw.sin(), 0.0, -yaw.cos())
 }
 fn right(yaw: f32) -> Vec3 {
     Vec3::new(yaw.cos(), 0.0, -yaw.sin())
 }
-fn horiz(v: Vec3) -> Vec3 {
+pub(crate) fn horiz(v: Vec3) -> Vec3 {
     Vec3::new(v.x, 0.0, v.z)
 }
 /// Unreal units per second (cm/s) to m/s, for thresholds written inline in the game's scripts.
@@ -470,6 +536,11 @@ impl Controller {
             coiled: false,
             melee: None,
             melee_left: false,
+            targets: Vec::new(),
+            hit_bone: None,
+            melee_last_start: Vec3::ZERO,
+            speed_log: Default::default(),
+            melee_no_input: false,
             low_grav: 0.0,
             dodging: false,
             look_at: None,
@@ -477,6 +548,12 @@ impl Controller {
             against_wall: AgainstWall::default(),
             dodge_redo: 0.0,
             fixture_cooldown: 0.0,
+            zip_braced: false,
+            zip_from_left: false,
+            zip_start_rate: 1.0,
+            takedowns: 0,
+            wallrun_wall_above: true,
+            grab_speed: 0.0,
             springboard: None,
             hang_time: 0.0,
             shimmy: None,
@@ -593,6 +670,15 @@ impl Controller {
             input.look = Vec2::ZERO;
             self.pitch -= self.pitch * (dt / 0.3).min(1.0);
         }
+        // TdMOVE_Disarm: DisableLookTime / DisableMovementTime -1, for the whole move.
+        if matches!(self.state, State::Takedown { .. }) {
+            input.look = Vec2::ZERO;
+            input.move_axis = Vec2::ZERO;
+            input.jump_pressed = false;
+            input.crouch_pressed = false;
+            input.turn_pressed = false;
+            input.melee_pressed = false;
+        }
         if self.turn.is_none() {
             self.yaw += input.look.x;
         }
@@ -609,14 +695,18 @@ impl Controller {
         if input.turn_pressed && self.turn.is_none() && self.can_turn() {
             self.start_turn();
         }
-        if let Some(m) = &mut self.melee {
-            m.t += dt;
-            if m.t >= self.tuning.melee_time {
-                self.melee = None;
+        if input.melee_pressed {
+            if self.melee.is_some() {
+                self.melee_pressed_again();
+            } else {
+                self.start_melee();
             }
         }
-        if input.melee_pressed && self.melee.is_none() {
-            self.start_melee();
+        if self.melee_no_input {
+            input.move_axis = Vec2::ZERO;
+        }
+        if input.takedown_pressed {
+            self.try_takedown(world);
         }
 
 
@@ -631,11 +721,16 @@ impl Controller {
                 sub.crouch_pressed = false;
                 sub.turn_pressed = false;
                 sub.melee_pressed = false;
+                sub.takedown_pressed = false;
                 sub.look = Vec2::ZERO;
             }
             self.substep(h, &sub, world);
             remaining -= h;
             first = false;
+        }
+        self.melee_tick(dt.min(0.1));
+        if self.state == State::Ground {
+            self.melee_no_input = false;
         }
 
         if self.state != State::Air {
@@ -767,17 +862,44 @@ impl Controller {
             return;
         }
         let kind = match self.state {
-            State::Ground if self.crouched => MeleeKind::Uppercut,
-            State::Ground if self.horizontal_speed() > self.tuning.run_speed * 0.75 => MeleeKind::RunKick,
+            State::Ground if self.crouched => MeleeKind::Crouch,
             State::Ground => MeleeKind::Punch,
+            // TdMove_MeleeAir.CanDoMove: not in the first 0.1 s of a jump.
+            State::Air if self.jumped_since_ground && self.air_time < 0.1 => return,
             State::Air => MeleeKind::AirKick,
             State::Slide { .. } => MeleeKind::SlideKick,
             State::WallRun { .. } => MeleeKind::WallRunKick,
             _ => return,
         };
         self.melee_left = !self.melee_left;
-        let left = self.melee_left;
-        self.melee = Some(Melee { kind, t: 0.0, left });
+        let left = match self.state {
+            // bLeft: the wallrun was along a wall on her left.
+            State::WallRun { normal, .. } => normal.dot(right(self.yaw)) > 0.0,
+            _ => self.melee_left,
+        };
+        let mut m = Melee {
+            kind,
+            t: 0.0,
+            left,
+            phase: MeleePhase::Start,
+            target: self.melee_target(kind),
+            air_type: 0,
+            detecting: false,
+            detect_in: None,
+            queued: 0,
+            combo: 0,
+            // TdMove_Melee.TriggerMove: OpenWindow(0.33).
+            window: if kind == MeleeKind::Punch { 0.33 } else { 0.0 },
+            momentum: Vec3::ZERO,
+        };
+        match kind {
+            MeleeKind::AirKick => self.start_air_kick(&mut m),
+            MeleeKind::WallRunKick => self.start_wallrun_kick(&mut m),
+            // TdMove_MeleeSlide.TriggerMove: SetTimer(0.2542) turns the hit detection on.
+            MeleeKind::SlideKick => m.detect_in = Some(0.2542),
+            MeleeKind::Punch | MeleeKind::Crouch => {}
+        }
+        self.melee = Some(m);
         self.events.push(Event::Melee { kind, left });
     }
 
@@ -888,12 +1010,13 @@ impl Controller {
             State::Traverse(tr) => self.traverse(dt, tr, world),
             State::Vault(v) => self.vault_step(dt, v, world),
             State::LayOnGround { t, getting_up, back_roll } => self.lay_on_ground(dt, t, getting_up, back_roll, input, world),
-            State::Barge { t, door, hands, hit, dir } => self.barge(dt, t, door, hands, hit, dir, world),
+            State::Barge { t, door, hands, hit, dir, rate } => self.barge(dt, t, door, hands, hit, dir, rate, world),
             State::Stumble { t, forward, dir } => self.stumble(dt, t, forward, dir, world),
             State::SoftLand { t } => self.soft_land(dt, t, world),
             State::Balance { a, b, lean, danger, t } => self.balance(dt, a, b, lean, danger, t, input, world),
             State::ZipLine { a, b, s, speed } => self.zipline(dt, a, b, s, speed, input, world),
             State::Swing { a, b, at, dir, angle, rate } => self.swing(dt, a, b, at, dir, angle, rate, input, world),
+            State::Takedown { t, len, target, from, to, face } => self.takedown(dt, t, len, target, from, to, face),
         }
 
         self.check_barbed_wire(world);
@@ -975,7 +1098,7 @@ impl Controller {
         // Running: Mirror's Edge's own ground movement (locomotion.rs, from the game's native
         // code). The controller asks for sprint or walk acceleration, CalcVelocity applies it
         // with friction or braking, capped at GroundSpeed x the move's SpeedModifier.
-        let attacking = self.melee.is_some_and(|m| matches!(m.kind, MeleeKind::Punch | MeleeKind::Uppercut));
+        let attacking = self.melee.is_some_and(|m| matches!(m.kind, MeleeKind::Punch | MeleeKind::Crouch));
         let speed_mod = if self.crouched {
             tu.crouch_speed_modifier
         } else if attacking {
@@ -1352,6 +1475,11 @@ impl Controller {
                 self.wall_turned = false;
                 self.jump_buffer = 0.0;
                 self.last_wall_normal = Some(n);
+                // TdMove_WallRun.StartMove: a box (the cylinder's radius, 10 uu high) from 30 uu
+                // over her head, WallRunningStrafeCheckDistance (50 uu) into the wall.
+                let over = self.feet + Vec3::Y * (self.height() + uu(30.0) + uu(10.0));
+                let half = Vec3::new(tu.half_width, uu(10.0), tu.half_width);
+                self.wallrun_wall_above = world.sweep(half, over, -n * uu(50.0)).is_some();
                 self.events.push(Event::WallRunStart);
                 self.integrate(SUBSTEP, world, false);
                 return true;
@@ -1449,6 +1577,7 @@ impl Controller {
             self.feet.y = top - tu.hang_hands_above_feet + 0.4;
             self.crouched = true;
         }
+        self.grab_speed = self.vel.y;
         self.vel = Vec3::ZERO;
         self.state = State::LedgeHang { normal: n, ledge_y: top, turned: false };
         self.hang_time = 0.0;
@@ -1658,24 +1787,28 @@ impl Controller {
             if self.doors_open.get(i).is_some_and(|&o| o > 0.0) {
                 return None;
             }
-            // Trace from the cylinder centre straight ahead.
+            // Trace from the cylinder centre straight ahead: the door and how far it is.
             let steps = (reach / 0.05).ceil() as usize;
-            (0..=steps).map(|k| centre + fwd * (reach * k as f32 / steps.max(1) as f32)).any(|p| {
+            (0..=steps).map(|k| reach * k as f32 / steps.max(1) as f32).find(|&d| {
+                let p = centre + fwd * d;
                 p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y && p.z >= b.min.z && p.z <= b.max.z
-            }).then_some(i)
+            }).map(|d| (i, d))
         });
-        let Some(door) = door else { return false };
+        let Some((door, dist)) = door else { return false };
         let hands = speed > tu.barge_kick_threshold && forward_moving;
         let dir = if hands { h / speed } else { fwd };
+        // StartBargin: BargeInLeft at BargeAnimTime / TimeToDoor, clamped to 0.7..1.3.
+        let rate = if hands { (tu.barge_anim_time / (dist / barge_speed).max(1e-3)).clamp(0.7, 1.3) } else { 1.0 };
         if hands {
             self.vel = dir * barge_speed;
         }
-        self.state = State::Barge { t: 0.0, door, hands, hit: false, dir };
+        self.state = State::Barge { t: 0.0, door, hands, hit: false, dir, rate };
         self.events.push(Event::Barge { hands });
         true
     }
 
-    fn barge(&mut self, dt: f32, t: f32, door: usize, hands: bool, mut hit: bool, dir: Vec3, world: &dyn World) {
+    #[allow(clippy::too_many_arguments)]
+    fn barge(&mut self, dt: f32, t: f32, door: usize, hands: bool, mut hit: bool, dir: Vec3, rate: f32, world: &dyn World) {
         let tu = self.tuning.clone();
         let t = t + dt;
         if hands {
@@ -1697,7 +1830,7 @@ impl Controller {
             }
             self.integrate(dt, world, true);
             let done = t >= tu.barge_trace_time + 0.3 || (hit && t >= tu.barge_trace_time);
-            self.state = if done { State::Ground } else { State::Barge { t, door, hands, hit, dir } };
+            self.state = if done { State::Ground } else { State::Barge { t, door, hands, hit, dir, rate } };
         } else {
             // MeleeKickObject: move input ignored for 0.6 s; the kick lands on its notify.
             self.vel = Vec3::new(0.0, self.vel.y.min(0.0), 0.0);
@@ -1706,7 +1839,7 @@ impl Controller {
                 self.open_door(door);
             }
             self.integrate(dt, world, true);
-            self.state = if t >= tu.barge_kick_time { State::Ground } else { State::Barge { t, door, hands, hit, dir } };
+            self.state = if t >= tu.barge_kick_time { State::Ground } else { State::Barge { t, door, hands, hit, dir, rate } };
         }
     }
 
@@ -2250,6 +2383,15 @@ impl Controller {
                     if !world.is_free(&stand.aabb(feet)) {
                         continue;
                     }
+                    // TdMove_IntoZipLine.StartMove: to the line 100 units on, at
+                    // max(speed, 400); ZiplineStart at 0.3 / that time (0.2..2). Coming at it
+                    // from its left starts the ZipLine loop half way (ReachedPreciseLocation).
+                    let approach = horiz(self.vel).length().max(uu(400.0));
+                    let into = ((cp + u * uu(100.0)).distance(hands) / approach).max(1e-3);
+                    self.zip_start_rate = (0.3 / into).clamp(0.2, 2.0);
+                    let heading = if horiz(self.vel).length() > 0.5 { horiz(self.vel).normalize() } else { fwd };
+                    self.zip_from_left = heading.dot(Vec3::new(-u.z, 0.0, u.x)) > 0.0;
+                    self.zip_braced = false;
                     self.coiled = false;
                     self.crouched = false;
                     self.feet = feet;
@@ -2324,7 +2466,18 @@ impl Controller {
         let ns = s + speed * dt;
         let feet = a + u * ns - Vec3::Y * tu.zip_hang;
         let stand = Body { half_width: tu.half_width, height: tu.stand_height };
-        if !world.is_free(&stand.aabb(feet)) {
+        // The native zipline tick: a box (the cylinder, half its height) from 40 below its
+        // centre along the ride, 600 units while moving (a hit braces for it:
+        // PrepareForForwardImpact), 20 once braced (a hit is the impact).
+        let half = Vec3::new(tu.half_width, tu.stand_height * 0.25, tu.half_width);
+        let centre = self.feet + Vec3::Y * (tu.stand_height * 0.5 - uu(40.0));
+        let braced = self.zip_braced;
+        let ahead = world.sweep(half, centre, u * if braced { uu(20.0) } else { uu(600.0) }).is_some();
+        if ahead && !braced {
+            self.zip_braced = true;
+            self.events.push(Event::ZipBrace);
+        }
+        if (ahead && braced) || !world.is_free(&stand.aabb(feet)) {
             self.vel = -u * 0.5;
             self.let_go();
             self.events.push(Event::ZipEnd { hit_wall: true });

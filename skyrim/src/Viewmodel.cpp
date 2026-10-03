@@ -13,6 +13,8 @@
 // view blends to the world's so the legs meet the ground.
 #include "Viewmodel.h"
 
+#include "Config.h"
+
 #include <d3d11.h>
 #include <d3dcompiler.h>
 
@@ -36,16 +38,21 @@ cbuffer Frame : register(b0)
 	row_major float4x4 skyShadowProj[2];  // Skyrim's sun shadow cascades: camera-relative world -> shadow map uv, depth
 	float4 skyShadowSplits;               // cascade 0 end, cascade 1 end (view depth), -, cascade count
 	float4 skyShadowParams;               // slice of cascade 0, slice of cascade 1, texel size (uv), +1 standard / -1 reversed
+	float4 heldDepth;                     // Skyrim's near, far, reversed, on: what's in her hands goes in front
+	float4 heldScale;                     // this target's pixels -> Skyrim's depth texels (x, y); how close counts as held
+	row_major float4x4 prevWorldViewProj; // last frame's camera: this frame's camera-relative world -> its clip
 };
 cbuffer Object : register(b1)
 {
 	float4 maps;          // x: normal map, y: specular map
-	float4 mode;          // x: drawn with Skyrim's camera, into its depth (the legs)
+	float4 mode;          // x: drawn with Skyrim's camera, into its depth (the legs);
+	                      // w: stands still in the world (the course): its motion for Skyrim's TAA
 };
 Texture2D colourMap : register(t0);
 Texture2D normalMap : register(t1);
 Texture2D specMap : register(t2);
 Texture2DArray<float> skyrimShadowMaps : register(t3);
+Texture2D<float> skyrimDepth : register(t4);
 SamplerState linearSampler : register(s0);
 SamplerState pointSampler : register(s1);
 
@@ -64,6 +71,8 @@ struct VSOut
 	float4 tangent : TEXCOORD2;
 	float2 uv : TEXCOORD3;
 	float3 rel : TEXCOORD4;   // camera-relative world position
+	float4 clipNow : TEXCOORD5;
+	float4 clipPrev : TEXCOORD6;
 };
 struct PSOut
 {
@@ -80,6 +89,8 @@ VSOut VS(VSIn i)
 	o.normal = i.normal;
 	o.tangent = i.tangent;
 	o.uv = i.uv;
+	o.clipNow = o.pos;
+	o.clipPrev = mode.w > 0.5 ? mul(prevWorldViewProj, float4(o.rel, 1.0)) : o.pos;
 	return o;
 }
 
@@ -121,6 +132,17 @@ float SkyrimSunShadow(float3 rel, float3 n, float viewZ)
 
 PSOut PS(VSOut i, bool front : SV_IsFrontFace)
 {
+	// Her arms are drawn over everything (their own depth), except what Skyrim drew right in
+	// front of her: the weapon, shield or spell in her hand (Skyrim's first-person objects, posed
+	// into her grip), so her fingers close round it rather than over it.
+	if (mode.x < 0.5 && heldDepth.w > 0.5) {
+		float d = skyrimDepth.Load(int3(i.pos.xy * heldScale.xy, 0));
+		float n = heldDepth.x, f = heldDepth.y;
+		float z = heldDepth.z > 0.5 ? f * n / (n + d * (f - n)) : f * n / max(f - d * (f - n), 1e-4);
+		if (z < heldScale.z && z < -i.view.z - 0.5) {
+			discard;
+		}
+	}
 	float3 n = normalize(i.normal) * (front ? 1.0 : -1.0);
 	if (maps.x > 0.5) {
 		float3 t = normalize(i.tangent.xyz - n * dot(i.tangent.xyz, n));
@@ -149,7 +171,11 @@ PSOut PS(VSOut i, bool front : SV_IsFrontFace)
 	} else {
 		o.color = float4(albedo.rgb * max(lit, 0.0) + spec, 1.0);
 	}
-	o.motion = float4(0.0, 0.0, 0.0, 1.0);  // stays put on screen: Skyrim's TAA shouldn't drag it
+	// Her body stays put on screen: Skyrim's TAA shouldn't drag it. The course stands still in
+	// the world: it moved on screen as the camera did, which TAA needs to know or it smears the
+	// last frame over this one (Skyrim's convention: (-0.5, 0.5) x (now - before), in NDC).
+	float2 now = i.clipNow.xy / i.clipNow.w, before = i.clipPrev.xy / max(abs(i.clipPrev.w), 1e-6) * sign(i.clipPrev.w);
+	o.motion = mode.w > 0.5 ? float4(float2(-0.5, 0.5) * (now - before), 0.0, 1.0) : float4(0.0, 0.0, 0.0, 1.0);
 	return o;
 }
 )";
@@ -241,6 +267,9 @@ float4 PS(VSOut i) : SV_Target
 			float skyShadowProj[2][4][4];
 			float skyShadowSplits[4];
 			float skyShadowParams[4];
+			float heldDepth[4];
+			float heldScale[4];
+			float prevWorldViewProj[4][4];
 		};
 		struct ObjectConstants
 		{
@@ -1166,6 +1195,23 @@ float4 PS(VSOut i) : SV_Target
 		return 2.0f * std::atan(std::tan(v * 0.5f) * (4.0f / 3.0f)) * 57.2957795f;
 	}
 
+	float BodyScreenScale(const FaithFrame& a_frame, float a_worldFovDeg)
+	{
+		float aspect = 16.0f / 9.0f;
+		if (auto* renderer = RE::BSGraphics::Renderer::GetSingleton()) {
+			if (auto* tex = reinterpret_cast<ID3D11Texture2D*>(renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN].texture)) {
+				D3D11_TEXTURE2D_DESC d{};
+				tex->GetDesc(&d);
+				aspect = static_cast<float>(d.Width) / static_cast<float>(std::max(d.Height, 1u));
+			}
+		}
+		// Skyrim's FOV setting is horizontal at 4:3.
+		const float worldV = 2.0f * std::atan(std::tan(a_worldFovDeg * 0.5f * 0.0174532925f) * 0.75f);
+		const float worldH = 2.0f * std::atan(std::tan(worldV * 0.5f) * aspect);
+		const float arms = ArmsFov(a_frame, a_worldFovDeg, aspect);
+		return std::tan(worldH * 0.5f) / std::tan(arms * 0.5f);
+	}
+
 	void SetVisible(bool a_on) { visible = a_on; }
 	bool Visible() { return visible; }
 	bool Ready() { return ready; }
@@ -1275,6 +1321,27 @@ float4 PS(VSOut i) : SV_Target
 			}
 			fc.worldViewProj[r][3] = float(double(w2c[r][3]) + double(w2c[r][0]) * cam.x + double(w2c[r][1]) * cam.y + double(w2c[r][2]) * cam.z);
 		}
+		// Last frame's camera, taking this frame's camera-relative positions (the course's motion
+		// for TAA). The first frame: none.
+		static float lastW2c[4][4]{};
+		static bool  haveLast = false;
+		for (int r = 0; r < 4; ++r) {
+			for (int c = 0; c < 4; ++c) {
+				fc.prevWorldViewProj[r][c] = fc.worldViewProj[r][c];
+			}
+			if (haveLast) {
+				for (int c = 0; c < 3; ++c) {
+					fc.prevWorldViewProj[r][c] = lastW2c[r][c];
+				}
+				fc.prevWorldViewProj[r][3] = float(double(lastW2c[r][3]) + double(lastW2c[r][0]) * cam.x + double(lastW2c[r][1]) * cam.y + double(lastW2c[r][2]) * cam.z);
+			}
+		}
+		for (int r = 0; r < 4; ++r) {
+			for (int c = 0; c < 4; ++c) {
+				lastW2c[r][c] = w2c[r][c];
+			}
+		}
+		haveLast = true;
 		const auto& fr = worldCam->GetRuntimeData2().viewFrustum;
 		auto        depthAt = [&](float a_dist) {
 			const RE::NiPoint3 p = back * -a_dist;
@@ -1328,7 +1395,7 @@ float4 PS(VSOut i) : SV_Target
 			std::memcpy(m.pData, courseVerts.data(), courseVerts.size() * sizeof(FaithVertex));
 			context->Unmap(courseVb, 0);
 		}
-		ObjectConstants oc{ { 0.0f, 0.0f, 0.0f, 0.0f }, { 1.0f, a_late ? 1.0f : 0.0f, 0.0f, 0.0f } };
+		ObjectConstants oc{ { 0.0f, 0.0f, 0.0f, 0.0f }, { 1.0f, a_late ? 1.0f : 0.0f, 0.0f, 1.0f } };
 		if (SUCCEEDED(context->Map(objectCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
 			std::memcpy(m.pData, &oc, sizeof(oc));
 			context->Unmap(objectCb, 0);
@@ -1420,6 +1487,7 @@ float4 PS(VSOut i) : SV_Target
 		const auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 		auto*       worldDsv = reinterpret_cast<ID3D11DepthStencilView*>(depth.views[0]);
 		bool        legsInWorld = false, reversed = false;
+		ID3D11ShaderResourceView* heldSrv = nullptr;
 		if (worldCam && worldDsv && depth.texture) {
 			D3D11_TEXTURE2D_DESC dd{};
 			reinterpret_cast<ID3D11Texture2D*>(depth.texture)->GetDesc(&dd);
@@ -1441,6 +1509,15 @@ float4 PS(VSOut i) : SV_Target
 			};
 			reversed = depthAt(std::max(fr.fNear, 1.0f) * 2.0f) > depthAt(std::max(fr.fFar * 0.25f, 100.0f));
 			legsInWorld = dd.Width == sd.Width && dd.Height == sd.Height && (worldCam->world.translate - cam).Length() < 1.0f;
+			if (GetConfig().heldInGrip && depth.depthSRV && (worldCam->world.translate - cam).Length() < 1.0f) {
+				// Drawn late, this target is the whole screen and Skyrim's scene its scaled part.
+				const auto scene = SceneViewport(dd.Width, dd.Height);
+				const float sx = a_late ? scene.Width / static_cast<float>(sd.Width) : static_cast<float>(dd.Width) / static_cast<float>(sd.Width);
+				const float sy = a_late ? scene.Height / static_cast<float>(sd.Height) : static_cast<float>(dd.Height) / static_cast<float>(sd.Height);
+				Set4(fc.heldDepth, std::max(fr.fNear, 0.1f), fr.fFar, reversed ? 1.0f : 0.0f, 1.0f);
+				Set4(fc.heldScale, sx, sy, GetConfig().heldRange, 0.0f);
+				heldSrv = reinterpret_cast<ID3D11ShaderResourceView*>(depth.depthSRV);
+			}
 			static bool logged = false;
 			if (!logged) {
 				logged = true;
@@ -1497,9 +1574,9 @@ float4 PS(VSOut i) : SV_Target
 			context->IASetIndexBuffer(part.ib, DXGI_FORMAT_R32_UINT, 0);
 			for (const auto& sec : part.sections) {
 				const auto*               mat = sec.material < part.materials.size() ? &part.materials[sec.material] : nullptr;
-				ID3D11ShaderResourceView* srvs[4] = { mat && mat->colour ? mat->colour : white, mat && mat->normal ? mat->normal : white,
-					mat && mat->spec ? mat->spec : white, shadowMaps };
-				context->PSSetShaderResources(0, 4, srvs);
+				ID3D11ShaderResourceView* srvs[5] = { mat && mat->colour ? mat->colour : white, mat && mat->normal ? mat->normal : white,
+					mat && mat->spec ? mat->spec : white, shadowMaps, a_world ? nullptr : heldSrv };
+				context->PSSetShaderResources(0, 5, srvs);
 				ObjectConstants oc{ { mat && mat->normal ? 1.0f : 0.0f, mat && mat->spec ? 1.0f : 0.0f, 0.0f, 0.0f }, { a_world ? 1.0f : 0.0f, a_late ? 1.0f : 0.0f, 0.0f, 0.0f } };
 				D3D11_MAPPED_SUBRESOURCE om{};
 				if (SUCCEEDED(context->Map(objectCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &om))) {

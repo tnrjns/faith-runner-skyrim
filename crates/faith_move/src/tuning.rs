@@ -337,7 +337,9 @@ pub struct Tuning {
     // ---------------------------------------------------------------- melee
     /// ME: the attack animations' lengths (MeleeStart + MeleeMissed ≈ 0.7 s);
     /// the app sets these from the real animations.
-    pub melee_time: f32,
+    pub melee_clips: MeleeClips,
+    /// The takedown clips' lengths (takedown::TAKEDOWN_ANIMS): each takedown lasts its clip.
+    pub takedown_clips: [f32; 4],
     /// ME: TdMove_MeleeCrouch.SpeedModifier = 0.2 / guess for standing
     pub melee_speed: f32,
 }
@@ -503,7 +505,8 @@ impl Default for Tuning {
             swing_exit_gravity: 0.75,
             swing_exit_gravity_time: 0.7,
 
-            melee_time: 0.7,
+            melee_clips: MeleeClips::default(),
+            takedown_clips: [2.53, 2.10, 2.03, 1.97],
             melee_speed: 0.4,
         }
     }
@@ -513,5 +516,44 @@ impl Tuning {
     /// Launch speed needed to rise `height` metres under normal gravity.
     pub fn speed_for_height(&self, height: f32) -> f32 {
         (2.0 * self.gravity * height.max(0.0)).sqrt()
+    }
+}
+
+/// How long each attack's clips play (seconds, at the rate the move plays them). Set from the
+/// animations when they're loaded (faith_anim's `Rig::tune`); these stand in without them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeleeClips {
+    /// TdMove_Melee: MeleeStart, MeleeHit, MeleeMissed (Left), at 1.5 x.
+    pub punch_start: f32,
+    pub punch_hit: f32,
+    pub punch_missed: f32,
+    /// TdMove_MeleeCrouch: MeleeCrouchStart, MeleeCrouchHit.
+    pub crouch_start: f32,
+    pub crouch_hit: f32,
+    /// TdMove_MeleeAir: MeleeInAir, MeleeInAirStill, MeleeFromAbove, MeleeInAirHit.
+    pub air: f32,
+    pub air_still: f32,
+    pub air_from_above: f32,
+    pub air_hit: f32,
+    /// TdMove_MeleeSlide: MeleeSlide. TdMove_MeleeWallrun: MeleeWallRunLeft.
+    pub slide: f32,
+    pub wallrun: f32,
+}
+
+impl Default for MeleeClips {
+    fn default() -> Self {
+        MeleeClips {
+            punch_start: 0.25,
+            punch_hit: 0.45,
+            punch_missed: 0.45,
+            crouch_start: 0.4,
+            crouch_hit: 0.5,
+            air: 0.8,
+            air_still: 0.8,
+            air_from_above: 0.8,
+            air_hit: 0.6,
+            slide: 0.9,
+            wallrun: 0.7,
+        }
     }
 }

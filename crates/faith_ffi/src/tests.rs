@@ -2,6 +2,7 @@
 
 use super::*;
 use super::course::*;
+use super::moving::*;
 
 const U: f32 = 70.0;
 
@@ -274,5 +275,195 @@ fn plays_the_moves_course() {
     assert_eq!(unsafe { faith_course_status(h, &mut s) }, 0);
     let (f, _) = run(h, 0.5, |_| FaithInput::default());
     assert!(f.on_ground != 0 && f.feet.z.abs() < 1.0, "back on the host's ground: {:?}", Vec3::from(f.feet));
+    unsafe { faith_destroy(h) };
+}
+
+/// Someone 1.2 m north: a punch lands on them (Mirror's Edge's 33.5), knocking them north; and
+/// someone 3 m off is missed.
+#[test]
+fn punches_land_on_the_hosts_actors() {
+    use super::melee::*;
+    assert_eq!(std::mem::size_of::<FaithTarget>(), 40);
+    assert_eq!(std::mem::size_of::<FaithHit>(), 24);
+    for (dist, lands) in [(1.2, true), (3.0, false)] {
+        let h = new();
+        world(h, 0.0);
+        unsafe { faith_teleport(h, FaithVec3::default(), 0.0) };
+        run(h, 0.3, |_| FaithInput::default());
+        let t = FaithTarget { id: 42, centre: FaithVec3 { x: 0.0, y: dist * U, z: 0.9 * U }, radius: 0.3 * U, half_height: 0.9 * U, eye: 0.6 * U, ..Default::default() };
+        unsafe { faith_set_targets(h, &t, 1) };
+        let mut got = vec![];
+        let mut pressed = false;
+        run(h, 1.2, |_| {
+            let p = !pressed;
+            pressed = true;
+            let mut out = [FaithHit::default(); 4];
+            let n = unsafe { faith_melee_hits(h, out.as_mut_ptr(), 4) } as usize;
+            got.extend_from_slice(&out[..n]);
+            FaithInput { melee_pressed: p as u8, ..Default::default() }
+        });
+        let mut out = [FaithHit::default(); 4];
+        let n = unsafe { faith_melee_hits(h, out.as_mut_ptr(), 4) } as usize;
+        got.extend_from_slice(&out[..n]);
+        if lands {
+            assert_eq!(got.len(), 1, "{dist} m");
+            assert_eq!((got[0].target, got[0].damage, got[0].kind), (42, 33.5, 0));
+            assert!(got[0].momentum.y > 0.0 && got[0].momentum.x.abs() < 1.0, "knocked north");
+        } else {
+            assert!(got.is_empty(), "{dist} m: missed");
+        }
+        unsafe { faith_destroy(h) };
+    }
+}
+
+/// A cable in the host's collision becomes a zipline (host frame back out).
+#[test]
+fn finds_a_zipline_in_the_hosts_collision() {
+    use super::world_fixtures::*;
+    assert_eq!(std::mem::size_of::<FaithFixtureCandidate>(), 32);
+    assert_eq!(std::mem::size_of::<FaithFixture>(), 28);
+    let h = new();
+    let cable = FaithFixtureCandidate {
+        a: FaithVec3 { x: 0.0, y: 0.0, z: 2.8 * U },
+        b: FaithVec3 { x: 0.0, y: 15.0 * U, z: 0.8 * U },
+        thickness: 0.02 * U,
+        capsule: 1,
+    };
+    unsafe { faith_set_fixture_candidates(h, &cable, 1) };
+    world(h, 0.0);
+    let mut out = [FaithFixture::default(); 4];
+    let n = unsafe { faith_world_fixtures(h, out.as_mut_ptr(), 4) } as usize;
+    assert_eq!(n, 1);
+    assert_eq!(out[0].kind, 0);
+    assert!((out[0].a.z - 2.8 * U).abs() < 0.5 && (out[0].b.y - 15.0 * U).abs() < 0.5);
+    unsafe { faith_destroy(h) };
+}
+
+/// A gate closing in front of her stops her the frame it's given.
+#[test]
+fn moving_collision_counts_the_frame_its_given() {
+    let h = new();
+    world(h, 0.0);
+    unsafe { faith_teleport(h, FaithVec3::default(), 0.0) };
+    run(h, 0.3, |_| FaithInput::default());
+    // A gate 2 m north, 3 m wide and high.
+    let gate = cube([-1.5 * U, 2.0 * U, 0.0], [1.5 * U, 2.2 * U, 3.0 * U]);
+    unsafe { faith_set_moving(h, gate.as_ptr(), (gate.len() / 9) as u32) };
+    let (f, _) = run(h, 2.0, |_| FaithInput { move_y: 1.0, ..Default::default() });
+    assert!(f.feet.y < 2.0 * U, "stopped by the gate: {}", f.feet.y);
+    // Opened (gone): she goes through.
+    unsafe { faith_set_moving(h, std::ptr::null(), 0) };
+    let (f, _) = run(h, 2.0, |_| FaithInput { move_y: 1.0, ..Default::default() });
+    assert!(f.feet.y > 3.0 * U, "through the open gate: {}", f.feet.y);
+    unsafe { faith_destroy(h) };
+}
+
+/// How long taking a host's collision takes (run with --ignored --nocapture).
+#[test]
+#[ignore]
+fn set_world_timing() {
+    let h = new();
+    let mut seed = 7u32;
+    let mut r = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let mut tris = vec![];
+    for _ in 0..2400 {
+        let c = [r() * 4800.0 - 2400.0, r() * 4800.0 - 2400.0, r() * 1400.0];
+        tris.extend(cube([c[0], c[1], c[2]], [c[0] + r() * 300.0, c[1] + r() * 300.0, c[2] + r() * 300.0]));
+    }
+    let n = (tris.len() / 9) as u32;
+    let t = std::time::Instant::now();
+    unsafe { faith_set_world(h, tris.as_ptr(), n) };
+    eprintln!("{n} triangles: faith_set_world {:?}", t.elapsed());
+    unsafe { faith_destroy(h) };
+}
+
+/// A takedown on someone 1.2 m north: facing her, a front snatch; facing away, the one from
+/// behind. Either way their clip is placed facing her. Each ends when her clip does.
+#[test]
+fn takedowns_from_the_front_and_behind() {
+    use super::melee::*;
+    assert_eq!(std::mem::size_of::<FaithTakedown>(), 36);
+    for (facing_y, back) in [(-1.0, false), (1.0, true)] {
+        let h = new();
+        world(h, 0.0);
+        unsafe { faith_teleport(h, FaithVec3::default(), 0.0) };
+        run(h, 0.3, |_| FaithInput::default());
+        let t = FaithTarget {
+            id: 7,
+            centre: FaithVec3 { x: 0.0, y: 1.2 * U, z: 0.9 * U },
+            radius: 0.3 * U,
+            half_height: 0.9 * U,
+            eye: 0.6 * U,
+            facing: FaithVec3 { x: 0.0, y: facing_y, z: 0.0 },
+        };
+        unsafe { faith_set_targets(h, &t, 1) };
+        let mut got = vec![];
+        let mut pressed = false;
+        run(h, 3.0, |_| {
+            let p = !pressed;
+            pressed = true;
+            let mut out = [FaithTakedown::default(); 4];
+            let n = unsafe { faith_takedowns(h, out.as_mut_ptr(), 4) } as usize;
+            got.extend_from_slice(&out[..n]);
+            FaithInput { takedown_pressed: p as u8, ..Default::default() }
+        });
+        assert_eq!(got.len(), 2, "started and ended");
+        let (s, e) = (got[0], got[1]);
+        assert!(s.target == 7 && s.done == 0 && e.target == 7 && e.done == 1);
+        assert_eq!(s.anim == 3, back, "anim {}", s.anim);
+        assert!((s.enemy_dir.y + 1.0).abs() < 0.1, "their clip faces her (south): {:?}", Vec3::from(s.enemy_dir));
+        unsafe { faith_destroy(h) };
+    }
+}
+
+/// The ground under a point, in Faith's world: the floor's top (z 0), and nothing past the drop.
+#[test]
+fn ground_below_finds_the_floor() {
+    use super::course::faith_ground_below;
+    let h = new();
+    world(h, 0.0);
+    let mut out = FaithVec3::default();
+    let at = FaithVec3 { x: 3.0 * U, y: -2.0 * U, z: 2.0 * U };
+    assert_eq!(unsafe { faith_ground_below(h, at, 5.0 * U, &mut out) }, 1);
+    assert!(out.z.abs() < 0.05 * U && (out.x - at.x).abs() < 1.0 && (out.y - at.y).abs() < 1.0, "{:?}", Vec3::from(out));
+    assert_eq!(unsafe { faith_ground_below(h, at, 1.0 * U, &mut out) }, 0, "the floor is 2 m down");
+    unsafe { faith_destroy(h) };
+}
+
+/// With Mirror's Edge: a Skyrim-named arm binds to the disarm's victim (the cop) and poses
+/// through its clips; the bound arm's hand moves over the takedown.
+#[test]
+fn the_victim_binds_and_poses() {
+    let Some(dir) = std::env::var_os("ME_INSTALL") else { return };
+    use super::victim::*;
+    let dir = CString::new(dir.to_string_lossy().into_owned()).unwrap();
+    let h = unsafe { faith_create(dir.as_ptr(), U) };
+    world(h, 0.0);
+    let names = ["NPC Spine2 [Spn2]", "NPC L Clavicle [LClv]", "NPC L UpperArm [LUar]", "NPC L Forearm [LLar]", "NPC L Hand [LHnd]"];
+    let cnames: Vec<CString> = names.iter().map(|n| CString::new(*n).unwrap()).collect();
+    let ptrs: Vec<*const c_char> = cnames.iter().map(|c| c.as_ptr()).collect();
+    let parents = [-1, 0, 1, 2, 3];
+    let rest: Vec<FaithXform> = [[0.0, 0.0, 90.0], [-3.0, 0.0, 10.0], [-12.0, 0.0, 0.0], [-20.0, 0.0, 0.0], [-18.0, 0.0, 0.0]]
+        .iter()
+        .map(|p| FaithXform { rot: [0.0, 0.0, 0.0, 1.0], pos: *p, scale: 1.0 })
+        .collect();
+    let id = unsafe { faith_bind_victim(h, 5, ptrs.as_ptr(), parents.as_ptr(), rest.as_ptr()) };
+    assert!(id >= 0, "{:?}", unsafe { CStr::from_ptr(faith_last_error()) });
+    let root = FaithXform { rot: [0.0, 0.0, 0.0, 1.0], pos: [0.0, 0.0, 0.0], scale: 1.0 };
+    let mut rots = vec![];
+    for anim in 0..4 {
+        for t in [0.2, 1.0] {
+            let mut out = vec![FaithXform::default(); 5];
+            assert_eq!(unsafe { faith_pose_victim(h, id, anim, t, FaithVec3::default(), 1.0, root, out.as_mut_ptr()) }, 1);
+            assert!(out.iter().all(|o| o.rot.iter().chain(&o.pos).all(|v| v.is_finite())));
+            rots.push(Quat::from_array(out[3].rot));
+        }
+    }
+    assert!(rots.windows(2).any(|w| w[0].angle_between(w[1]) > 0.1), "the forearm moves");
     unsafe { faith_destroy(h) };
 }

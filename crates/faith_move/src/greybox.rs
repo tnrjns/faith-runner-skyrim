@@ -58,6 +58,16 @@ pub enum Surface {
     MetalPipe,
     /// Vents, ducts and AC units.
     Airduct,
+    // The game's other footstep sets (A_Material_Footstep), for surfaces a host game names.
+    Wood,
+    /// Grating and gantries.
+    MetalGantry,
+    MetalLadder,
+    /// Chain-link (handsteps).
+    MetalFence,
+    Cardboard,
+    Water,
+    Glass,
 }
 
 impl Surface {

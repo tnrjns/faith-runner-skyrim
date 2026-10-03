@@ -27,7 +27,8 @@ typedef struct FaithInput {
     uint8_t crouch_pressed, crouch_held;
     uint8_t turn_pressed;       /* the 180 turn */
     uint8_t melee_pressed;      /* attack / barge */
-    uint8_t _pad[2];
+    uint8_t takedown_pressed;   /* a takedown on whoever's in front of her (faith_takedowns) */
+    uint8_t _pad;
 } FaithInput;
 
 /* FaithFrame.events */
@@ -50,6 +51,7 @@ typedef struct FaithInput {
 #define FAITH_EV_SPRINGBOARD (1ull << 16)
 #define FAITH_EV_MELEE       (1ull << 17)
 #define FAITH_EV_BARGE       (1ull << 18)
+#define FAITH_EV_MELEE_HIT   (1ull << 19)  /* an attack landed: faith_melee_hits */
 #define FAITH_EV_OTHER       (1ull << 31)
 
 /* Where everything is after a step. */
@@ -67,7 +69,7 @@ typedef struct FaithFrame {
     uint8_t on_ground;
     uint8_t animated;     /* a Mirror's Edge install was found */
     uint8_t intermediate; /* arms draw in the world's depth this frame (swinging) */
-    uint8_t _pad;
+    uint8_t low;          /* crouched or sliding (e.g. sneaking, to the host) */
     float speed_blur;     /* Mirror's Edge's speed blur (TdMotionBlurShader's MotionPacked.r): ~0.5 at full speed */
 } FaithFrame;
 
@@ -114,7 +116,89 @@ uint8_t faith_pose_skeleton(Faith* f, int32_t skeleton, FaithXform root_parent, 
  * the hands exactly on Faith's (what they hold goes in her grip, when her own body is drawn). The
  * body: the shoulders exactly on Faith's against her camera (the body seen in first person). */
 #define FAITH_POSE_PIN_HANDS 1u
+/* With PIN_HANDS: the arms reach for where Faith's hands appear on screen, for a body drawn with
+ * a narrower view than her arms (her arms use Mirror's Edge's 100 degrees): k from
+ * faith_set_screen_scale = tan(the body's horizontal half FOV) / tan(her arms'). */
+#define FAITH_POSE_SCREEN_MATCH 2u
+void faith_set_screen_scale(Faith* f, float k);
 uint8_t faith_pose_skeleton_ex(Faith* f, int32_t skeleton, FaithXform root_parent, uint32_t flags, FaithXform* out);
+
+/* What moves in the host's world (doors, gates, drawbridges), given again every frame: triangles
+ * as faith_set_world, collided with together with it. An empty list clears it. */
+void faith_set_moving(Faith* f, const float* tris, uint32_t count);
+
+/* What her feet and hands touch, for her step sounds (Mirror's Edge's sets): 0 concrete (and
+ * anything the game has no sound for), 1 wood, 2 metal, 3 metal grating, 4 metal ladder,
+ * 5 chain-link, 6 metal pipe, 7 airduct, 8 cardboard, 9 water, 10 glass. */
+void faith_set_surfaces(Faith* f, uint32_t feet, uint32_t hands);
+
+/* Faith's attacks on the host's actors, decided as Mirror's Edge decides them (its target
+ * choice, hit tests, damage and the momentum of the blow). Give who's around before each
+ * faith_step; read what landed after it. Host frame and units. */
+typedef struct FaithTarget {
+    uint32_t id;          /* yours, given back in FaithHit */
+    FaithVec3 centre;     /* the middle of its collision capsule */
+    float radius, half_height;
+    float eye;            /* its eyes above the centre */
+    FaithVec3 facing;     /* which way it faces (a takedown from behind or the front) */
+} FaithTarget;
+typedef struct FaithHit {
+    uint32_t target;
+    float damage;         /* Mirror's Edge's hit points: punch 33.5, air kick 60-100, slide 60, wallrun 80 */
+    FaithVec3 momentum;   /* units/s */
+    uint32_t kind;        /* 0 punch, 1 air kick, 2 slide kick, 3 wallrun kick, 4 crouch attack */
+} FaithHit;
+#ifdef __cplusplus
+static_assert(sizeof(FaithTarget) == 40 && sizeof(FaithHit) == 24, "faith.h layout");
+#endif
+void     faith_set_targets(Faith* f, const FaithTarget* targets, uint32_t count);
+uint32_t faith_melee_hits(Faith* f, FaithHit* out, uint32_t max);  /* this step's; out NULL to count */
+
+/* Mirror's Edge's disarm (TdMOVE_Disarm) as a takedown: FaithInput.takedown_pressed with a
+ * target in front of her. At the start (done 0) put the target at enemy_at and hold it there; its
+ * side of the takedown (faith_pose_victim) is placed facing enemy_dir (towards her, always); when her clip ends (done 1) it's yours to finish (knock down, kill...).
+ * anim: 0-2 a front snatch, 3 from behind. */
+typedef struct FaithTakedown {
+    uint32_t target;
+    uint32_t anim;
+    uint32_t done;
+    FaithVec3 enemy_at;
+    FaithVec3 enemy_dir;
+} FaithTakedown;
+#ifdef __cplusplus
+static_assert(sizeof(FaithTakedown) == 36, "faith.h layout");
+#endif
+uint32_t faith_takedowns(Faith* f, FaithTakedown* out, uint32_t max);  /* this step's; out NULL to count */
+
+/* The takedown's victim side: Mirror's Edge's enemy clip for the same takedown (the patrol
+ * cop's), retargeted onto a host skeleton. Bind like faith_bind_skeleton (the whole body); then
+ * each frame of the takedown pose it `time` seconds in, feet at `feet` facing `heading` (as
+ * FaithFrame.heading), and write the local transforms onto the live nodes. */
+int32_t faith_bind_victim(Faith* f, uint32_t count, const char* const* names, const int32_t* parents, const FaithXform* rest);
+uint8_t faith_pose_victim(Faith* f, int32_t skeleton, uint32_t anim, float time, FaithVec3 feet, float heading, FaithXform root_parent, FaithXform* out);
+
+/* The ground under a host point: the first solid below it (from 0.5 m above, up to `drop` units
+ * down) in the world Faith moves in now (a course's own while on one), so you can stand your
+ * people on what only Faith collides with. 0 if there's nothing. */
+uint8_t faith_ground_below(Faith* f, FaithVec3 at, float drop, FaithVec3* out);
+
+/* Ziplines, swing poles and balance beams in the host's own world. Before faith_set_world,
+ * pass the thin capsules (centre line, radius) and long thin boxes (middle of the top, half the
+ * width) in the collision; the ones that work as Mirror's Edge's fixtures are found with it. */
+typedef struct FaithFixtureCandidate {
+    FaithVec3 a, b;
+    float thickness;
+    uint32_t capsule;
+} FaithFixtureCandidate;
+typedef struct FaithFixture {
+    uint32_t kind;   /* 0 zipline (a: the high end), 1 swing pole, 2 balance beam */
+    FaithVec3 a, b;
+} FaithFixture;
+#ifdef __cplusplus
+static_assert(sizeof(FaithFixtureCandidate) == 32 && sizeof(FaithFixture) == 28, "faith.h layout");
+#endif
+void     faith_set_fixture_candidates(Faith* f, const FaithFixtureCandidate* c, uint32_t count);
+uint32_t faith_world_fixtures(Faith* f, FaithFixture* out, uint32_t max);
 
 /* The app's training maps, played in the host. faith_course_start puts one (0 Moves, 1 Rooftops,
  * 2 Springboard, 3 Training) with its origin at `anchor` (host frame) and makes it Faith's whole

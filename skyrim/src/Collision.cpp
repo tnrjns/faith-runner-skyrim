@@ -224,7 +224,7 @@ namespace faith::Collision
 					RE::hkAabb local;
 					local.min = RE::hkVector4(llo[0], llo[1], llo[2], 0.0f);
 					local.max = RE::hkVector4(lhi[0], lhi[1], lhi[2], 0.0f);
-					static std::vector<RE::hkpShapeKey> keys(kMaxKeys);
+					thread_local std::vector<RE::hkpShapeKey> keys(kMaxKeys);  // per thread: read in the background too
 					const auto  found = std::min<std::uint32_t>(bv->QueryAabbImpl(local, keys.data(), kMaxKeys), kMaxKeys);
 					const auto* container = bv->GetContainer();
 					if (!container) {
@@ -405,6 +405,49 @@ namespace faith::Collision
 			}
 		}
 
+		// The thin, long pieces that may be ziplines, swing poles or balance beams (faith_ffi
+		// decides which): capsules at most 15 units thick and 70 long, and boxes thin across two
+		// ways and long the third (their top's middle line, or their centre line when they're a
+		// bar).
+		void Candidates(const Job& a_src, std::vector<FaithFixtureCandidate>& a_out)
+		{
+			for (const auto& cap : a_src.capsules) {
+				float ab[3];
+				Sub(cap.b, cap.a, ab);
+				if (cap.r <= 15.0f && Dot(ab, ab) >= 70.0f * 70.0f) {
+					a_out.push_back({ { cap.a[0], cap.a[1], cap.a[2] }, { cap.b[0], cap.b[1], cap.b[2] }, cap.r, 1 });
+				}
+			}
+			for (const auto& b : a_src.boxes) {
+				int l = 0;
+				for (int i = 1; i < 3; ++i) {
+					if (b.half[i] > b.half[l]) {
+						l = i;
+					}
+				}
+				const int s0 = (l + 1) % 3, s1 = (l + 2) % 3;
+				if (b.half[l] * 2.0f < 70.0f || b.half[s0] > 25.0f || b.half[s1] > 25.0f) {
+					continue;
+				}
+				// Of the two thin ways, the one nearer vertical is its height.
+				const int   up = std::fabs(b.axis[s0][2]) >= std::fabs(b.axis[s1][2]) ? s0 : s1;
+				const int   across = up == s0 ? s1 : s0;
+				const float sign = b.axis[up][2] >= 0.0f ? 1.0f : -1.0f;
+				float       ta[3], tb[3], ca[3], cb[3];
+				for (int k = 0; k < 3; ++k) {
+					const float top = b.c[k] + b.axis[up][k] * b.half[up] * sign;
+					ta[k] = top - b.axis[l][k] * b.half[l];
+					tb[k] = top + b.axis[l][k] * b.half[l];
+					ca[k] = b.c[k] - b.axis[l][k] * b.half[l];
+					cb[k] = b.c[k] + b.axis[l][k] * b.half[l];
+				}
+				a_out.push_back({ { ta[0], ta[1], ta[2] }, { tb[0], tb[1], tb[2] }, b.half[across], 0 });
+				if (b.half[s0] <= 8.0f && b.half[s1] <= 8.0f) {
+					a_out.push_back({ { ca[0], ca[1], ca[2] }, { cb[0], cb[1], cb[2] }, std::max(b.half[s0], b.half[s1]), 1 });
+				}
+			}
+		}
+
 		// Boxes, capsules (as boxes) and convex hulls -> triangles, plus the job's own triangles.
 		void Triangulate(const Job& a_src, std::vector<float>& a_out)
 		{
@@ -535,8 +578,11 @@ namespace faith::Collision
 		};
 		std::unordered_map<RE::FormID, std::optional<Patch>> patches;
 
+		std::mutex patchesLock;
+
 		const Patch* PatchFor(RE::FormID a_world)
 		{
+			std::scoped_lock guard(patchesLock);
 			auto it = patches.find(a_world);
 			if (it == patches.end()) {
 				std::optional<Patch> p;
@@ -609,12 +655,39 @@ namespace faith::Collision
 		}
 	}
 
-	bool Harvest(const RE::NiPoint3& a_center, float a_radius, float a_up, float a_down, std::vector<float>& a_out)
+	namespace
+	{
+		// The bodies that can move (outside Havok's fixed island: doors, gates, drawbridges,
+		// lifts, loose things), held so they're read again every frame (CollectMoving).
+		std::vector<RE::hkpEntity*> moving;
+		// Where each was when last read (and whether it was still in the world): unchanged, there's
+		// nothing to read again.
+		std::vector<std::array<float, 16>> movingAt;
+		bool                               movingFresh = true;
+
+		void ForgetMoving()
+		{
+			for (auto* e : moving) {
+				e->RemoveReference();
+			}
+			moving.clear();
+			movingAt.clear();
+			movingFresh = true;
+		}
+	}
+
+	namespace
+	{
+		// Read the collision of a_bhk's world around a_center (any thread: under the world's read
+		// lock). The bodies that can move are held (a reference each) in a_moving, not read.
+		bool HarvestOn(RE::bhkWorld* a_bhk, RE::FormID a_ws, const RE::NiPoint3& a_center, float a_radius, float a_up, float a_down, std::vector<float>& a_out,
+			std::vector<FaithFixtureCandidate>* a_candidates, std::vector<RE::hkpEntity*>& a_moving)
 	{
 		a_out.clear();
-		auto* player = RE::PlayerCharacter::GetSingleton();
-		auto* cell = player ? player->GetParentCell() : nullptr;
-		auto* bhk = cell ? cell->GetbhkWorld() : nullptr;
+		if (a_candidates) {
+			a_candidates->clear();
+		}
+		auto* bhk = a_bhk;
 		auto* world = bhk ? bhk->GetWorld1() : nullptr;
 		if (!world) {
 			return false;
@@ -626,6 +699,7 @@ namespace faith::Collision
 		int         bodies = 0, faulted = 0;
 		{
 			RE::BSReadLockGuard lock(bhk->worldLock);
+			bool fixed = true;
 			auto addIsland = [&](RE::hkpSimulationIsland* a_island) {
 				if (!a_island) {
 					return;
@@ -655,12 +729,19 @@ namespace faith::Collision
 						continue;
 					}
 					++bodies;
+					if (!fixed) {
+						// Read where it is each frame instead (CollectMoving).
+						entity->AddReference();
+						a_moving.push_back(entity);
+						continue;
+					}
 					if (!GuardedCollect(shape, xf, lo, hi, k, &job)) {
 						++faulted;
 					}
 				}
 			};
 			addIsland(world->fixedIsland);
+			fixed = false;
 			for (std::int32_t i = 0; i < world->activeSimulationIslands.size(); ++i) {
 				addIsland(world->activeSimulationIslands.data()[i]);
 			}
@@ -669,8 +750,11 @@ namespace faith::Collision
 			}
 		}
 		Triangulate(job, a_out);
-		if (auto* ws = player->GetWorldspace()) {
-			if (const auto* patch = PatchFor(ws->GetFormID())) {
+		if (a_candidates) {
+			Candidates(job, *a_candidates);
+		}
+		if (a_ws) {
+			if (const auto* patch = PatchFor(a_ws)) {
 				ApplyPatch(*patch, lo, hi, a_out);
 			}
 		}
@@ -680,6 +764,93 @@ namespace faith::Collision
 			logger::info("collision: {} bodies -> {} triangles ({} meshes, {} boxes, {} capsules, {} hulls){}", bodies, a_out.size() / 9, job.tris.size(),
 				job.boxes.size(), job.capsules.size(), job.convexes.size(), faulted ? fmt::format(", {} faulted", faulted) : "");
 		}
+		return true;
+	}
+
+	}
+
+	bool Harvest(const RE::NiPoint3& a_center, float a_radius, float a_up, float a_down, std::vector<float>& a_out, std::vector<FaithFixtureCandidate>* a_candidates)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		auto* bhk = cell ? cell->GetbhkWorld() : nullptr;
+		auto* ws = player ? player->GetWorldspace() : nullptr;
+		std::vector<RE::hkpEntity*> found;
+		const bool ok = HarvestOn(bhk, ws ? ws->GetFormID() : 0, a_center, a_radius, a_up, a_down, a_out, a_candidates, found);
+		ForgetMoving();
+		moving = std::move(found);
+		movingFresh = true;
+		return ok;
+	}
+
+	namespace
+	{
+		// One read in the background at a time; its result waits here for the main thread.
+		std::mutex                         asyncLock;
+		bool                               asyncBusy = false, asyncReady = false, asyncOk = false;
+		std::vector<float>                 asyncTris;
+		std::vector<FaithFixtureCandidate> asyncCandidates;
+		std::vector<RE::hkpEntity*>        asyncMoving;
+	}
+
+	bool HarvestAsync(const RE::NiPoint3& a_center, float a_radius, float a_up, float a_down, bool a_candidates)
+	{
+		{
+			std::scoped_lock guard(asyncLock);
+			if (asyncBusy) {
+				return false;
+			}
+			asyncBusy = true;
+		}
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		RE::NiPointer<RE::bhkWorld> bhk{ cell ? cell->GetbhkWorld() : nullptr };  // kept alive meanwhile
+		auto*                       ws = player ? player->GetWorldspace() : nullptr;
+		const RE::FormID            wsId = ws ? ws->GetFormID() : 0;
+		if (!bhk) {
+			std::scoped_lock guard(asyncLock);
+			asyncBusy = false;
+			return false;
+		}
+		std::thread([bhk, wsId, a_center, a_radius, a_up, a_down, a_candidates]() {
+			std::vector<float>                 tris;
+			std::vector<FaithFixtureCandidate> candidates;
+			std::vector<RE::hkpEntity*>        found;
+			const bool ok = HarvestOn(bhk.get(), wsId, a_center, a_radius, a_up, a_down, tris, a_candidates ? &candidates : nullptr, found);
+			std::scoped_lock guard(asyncLock);
+			for (auto* e : asyncMoving) {
+				e->RemoveReference();  // an earlier result nobody took
+			}
+			asyncTris = std::move(tris);
+			asyncCandidates = std::move(candidates);
+			asyncMoving = std::move(found);
+			asyncOk = ok;
+			asyncReady = true;
+			asyncBusy = false;
+		}).detach();
+		return true;
+	}
+
+	bool TakeHarvest(std::vector<float>& a_out, std::vector<FaithFixtureCandidate>& a_candidates)
+	{
+		std::scoped_lock guard(asyncLock);
+		if (!asyncReady) {
+			return false;
+		}
+		asyncReady = false;
+		if (!asyncOk) {
+			for (auto* e : asyncMoving) {
+				e->RemoveReference();
+			}
+			asyncMoving.clear();
+			return false;
+		}
+		a_out.swap(asyncTris);
+		a_candidates.swap(asyncCandidates);
+		ForgetMoving();
+		moving = std::move(asyncMoving);
+		asyncMoving.clear();
+		movingFresh = true;
 		return true;
 	}
 
@@ -792,5 +963,160 @@ namespace faith::Collision
 			}
 		}
 		return false;
+	}
+
+	namespace
+	{
+		// Skyrim's material -> Mirror's Edge's step sound set (faith_set_surfaces). Stone, and what
+		// Mirror's Edge has no sound for (dirt, grass, snow, sand, mud), are concrete.
+		std::uint32_t SurfaceOf(RE::MATERIAL_ID a_m)
+		{
+			using M = RE::MATERIAL_ID;
+			switch (a_m) {
+			case M::kWood:
+			case M::kWoodLight:
+			case M::kWoodHeavy:
+			case M::kWoodStairs:
+			case M::kWoodAsStairs:
+			case M::kBarrel:
+				return 1;
+			case M::kMetalLight:
+			case M::kMetalSolid:
+			case M::kMetalHeavy:
+			case M::kChainMetal:
+			case M::kChain:
+			case M::kPotsPans:
+				return 2;
+			case M::kBasket:
+			case M::kBook:
+			case M::kCarpet:
+				return 8;
+			case M::kWater:
+				return 9;
+			case M::kGlass:
+			case M::kGlassStairs:
+			case M::kIce:
+			case M::kIceForm:
+				return 10;
+			default:
+				return 0;
+			}
+		}
+	}
+
+	namespace
+	{
+		// The material where a ray hit: a mesh in a MOPP tree knows it per triangle (its own
+		// wrapper, not the tree's: the tree's has no table and reading one crashes); anything
+		// else is one material.
+		std::uint32_t MaterialUnguarded(const RE::hkpShape* a_shape, RE::hkpShapeKey a_key)
+		{
+			using T = RE::hkpShapeType;
+			const RE::hkpShape* leaf = a_shape;
+			if (a_shape->type == T::kMOPP) {
+				leaf = static_cast<const RE::hkpMoppBvTreeShape*>(a_shape)->child.childShape;
+			}
+			auto* wrapper = leaf ? leaf->userData : nullptr;
+			if (!wrapper) {
+				wrapper = a_shape->userData;
+			}
+			if (!wrapper) {
+				return 0;
+			}
+			if (leaf && leaf->type == T::kCompressedMesh && a_key != RE::HK_INVALID_SHAPE_KEY) {
+				return SurfaceOf(wrapper->GetMaterialID(a_key));
+			}
+			return SurfaceOf(wrapper->materialID);
+		}
+
+		// Guarded: odd collision data gives concrete steps, never a crash.
+		std::uint32_t GuardedMaterial(const RE::hkpShape* a_shape, RE::hkpShapeKey a_key)
+		{
+			__try {
+				return MaterialUnguarded(a_shape, a_key);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+	}
+
+	std::uint32_t SurfaceAt(const RE::NiPoint3& a_from, const RE::NiPoint3& a_to)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		auto* bhk = cell ? cell->GetbhkWorld() : nullptr;
+		if (!bhk) {
+			return 0;
+		}
+		const float   s = RE::bhkWorld::GetWorldScale();
+		RE::bhkPickData pick{};
+		pick.rayInput.from = RE::hkVector4(a_from.x * s, a_from.y * s, a_from.z * s, 0.0f);
+		pick.rayInput.to = RE::hkVector4(a_to.x * s, a_to.y * s, a_to.z * s, 0.0f);
+		pick.rayInput.enableShapeCollectionFilter = true;
+		pick.rayInput.filterInfo.SetCollisionLayer(RE::COL_LAYER::kLOS);
+		if (!bhk->PickObject(pick) || !pick.rayOutput.HasHit()) {
+			return 0;
+		}
+		const auto* shape = pick.rayOutput.rootCollidable ? pick.rayOutput.rootCollidable->GetShape() : nullptr;
+		return shape ? GuardedMaterial(shape, pick.rayOutput.shapeKeys[0]) : 0;
+	}
+
+	bool CollectMoving(std::vector<float>& a_out)
+	{
+		a_out.clear();
+		if (moving.empty()) {
+			return false;
+		}
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		auto* bhk = cell ? cell->GetbhkWorld() : nullptr;
+		if (!bhk) {
+			return false;
+		}
+		const float k = RE::bhkWorld::GetWorldScaleInverse();
+		const float lo[3] = { -1e9f, -1e9f, -1e9f }, hi[3] = { 1e9f, 1e9f, 1e9f };
+		Job         job;
+		{
+			RE::BSReadLockGuard lock(bhk->worldLock);
+			// Has anything moved (or left the world) since the last read?
+			bool changed = movingFresh || movingAt.size() != moving.size();
+			movingAt.resize(moving.size());
+			for (std::size_t i = 0; i < moving.size(); ++i) {
+				std::array<float, 16> now{};
+				const auto*           xf = moving[i]->world ? static_cast<const float*>(moving[i]->collidable.motion) : nullptr;
+				if (xf) {
+					std::memcpy(now.data(), xf, sizeof(now));
+				} else {
+					now.fill(std::numeric_limits<float>::quiet_NaN());
+				}
+				for (int c = 0; c < 16 && !changed; ++c) {
+					const float a = now[c], b = movingAt[i][c];
+					changed = !(a == b || (std::isnan(a) && std::isnan(b)) || std::fabs(a - b) < 1e-4f);
+				}
+				movingAt[i] = now;
+			}
+			movingFresh = false;
+			if (!changed) {
+				return false;
+			}
+			for (auto* e : moving) {
+				// Taken out of the world since (its cell unloaded, it was picked up): skip it.
+				if (!e->world) {
+					continue;
+				}
+				const auto* shape = e->collidable.shape;
+				const auto* xf = static_cast<const float*>(e->collidable.motion);
+				if (shape && xf && Finite(xf, 16)) {
+					GuardedCollect(shape, xf, lo, hi, k, &job);
+				}
+			}
+		}
+		Triangulate(job, a_out);
+		return true;
+	}
+
+	void Forget()
+	{
+		ForgetMoving();
 	}
 }

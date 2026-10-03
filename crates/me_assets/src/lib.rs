@@ -66,6 +66,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub const ARMS_PACKAGE: &str = "Characters/CH_TKY_Crim_Fixer_1P.upk";
 pub const ANIMS_PACKAGE: &str = "Animations/AS_C1P_Unarmed.upk";
+/// TdMove_Disarm's clips (SnatchFwd, SnatchFwd2, SnatchFwd3, SnatchBack, SnatchFail): the
+/// one-handed weapon set, as the game swaps it in for the disarm.
+pub const DISARM_PACKAGE: &str = "Animations/AS_C1P_OneHanded_Common.upk";
+/// The disarm's victim: the patrol cop and the clips it plays as Faith takes its gun
+/// (TdAIController.TriggerCannedAnim with the same name as hers).
+pub const VICTIM_PACKAGE: &str = "Characters/CH_TKY_Cop_Patrol.upk";
+pub const VICTIM_MESH: &str = "SK_TKY_Cop_Patrol";
+pub const VICTIM_ANIMS: &str = "Animations/AS_AI_PatrolCop_OneHanded.upk";
+pub const VICTIM_SET: &str = "AS_AI_PatrolCop_OneHanded";
 pub const ARMS_MESH: &str = "SK_UpperBody";
 pub const LEGS_MESH: &str = "SK_LowerBody";
 /// The arms' morph targets (TdPawnMesh1p.MorphSets): the forearm twist fixes.
@@ -173,7 +182,10 @@ impl FaithArms {
         let mut pkgs = Packages::new(&cooked);
         let arms_pkg = Rc::new(Package::open(&cooked.join(ARMS_PACKAGE))?);
         let mesh = SkeletalMesh::read(&arms_pkg, ARMS_MESH)?;
-        let anims = AnimSet::read(&Package::open(&cooked.join(ANIMS_PACKAGE))?)?;
+        let mut anims = AnimSet::read(&Package::open(&cooked.join(ANIMS_PACKAGE))?)?;
+        if let Ok(disarm) = Package::open(&cooked.join(DISARM_PACKAGE)).and_then(|p| AnimSet::read(&p)) {
+            anims.add_from(&disarm, |n| n.to_ascii_lowercase().starts_with("snatch"));
+        }
         let materials = slots(&mut pkgs, &arms_pkg, &mesh, max_texture);
         let legs = SkeletalMesh::read(&arms_pkg, LEGS_MESH).ok().filter(|l| {
             l.bones.len() == mesh.bones.len() && l.bones.iter().zip(&mesh.bones).all(|(a, b)| a.name == b.name)
@@ -188,6 +200,17 @@ impl FaithArms {
             .filter(|m| m.base_vertices as usize == mesh.vertices.len())
             .collect();
         Ok(FaithArms { mesh, anims, materials, legs, morphs, cooked_pc: cooked })
+    }
+
+    /// Another of the game's characters, skeleton and animations only (no textures, legs or
+    /// morphs): `mesh` from `package`, the AnimSet `set` from `anims` (e.g. the patrol cop and
+    /// AS_AI_PatrolCop_OneHanded, for the disarm's victim side).
+    pub fn load_character(install: &Path, package: &str, mesh: &str, anims: &str, set: &str) -> Result<Self> {
+        let cooked = cooked_pc(install).ok_or_else(|| Error::Missing(format!("TdGame/CookedPC under {}", install.display())))?;
+        let pkg = Package::open(&cooked.join(package))?;
+        let mesh = SkeletalMesh::read(&pkg, mesh)?;
+        let anims = AnimSet::read_named(&Package::open(&cooked.join(anims))?, set)?;
+        Ok(FaithArms { mesh, anims, materials: vec![], legs: None, morphs: vec![], cooked_pc: cooked })
     }
 
     pub fn bone(&self, name: &str) -> Option<usize> {

@@ -201,8 +201,29 @@ impl Rig {
         if let Some(l) = Driver::length(arms, "fallinglandroll") {
             t.roll_time = l * 0.75;
         }
-        if let (Some(a), Some(b)) = (Driver::length(arms, "MeleeStartLeft"), Driver::length(arms, "MeleeMissedLeft")) {
-            t.melee_time = a + b;
+        // The attacks end with their clips (OnCustomAnimEnd); TdMove_Melee plays its at 1.5 x.
+        let c = &mut t.melee_clips;
+        let len = |seq: &str, rate: f32, into: &mut f32| {
+            if let Some(l) = Driver::length(arms, seq) {
+                *into = l / rate;
+            }
+        };
+        len("MeleeStartLeft", 1.5, &mut c.punch_start);
+        len("MeleeHitLeft", 1.5, &mut c.punch_hit);
+        len("MeleeMissedLeft", 1.5, &mut c.punch_missed);
+        len("MeleeCrouchStart", 1.0, &mut c.crouch_start);
+        len("MeleeCrouchHit", 1.0, &mut c.crouch_hit);
+        len("MeleeInAir", 1.0, &mut c.air);
+        len("MeleeInAirStill", 1.0, &mut c.air_still);
+        len("MeleeFromAbove", 1.0, &mut c.air_from_above);
+        len("MeleeInAirHit", 1.0, &mut c.air_hit);
+        len("MeleeSlide", 1.0, &mut c.slide);
+        len("MeleeWallRunLeft", 1.0, &mut c.wallrun);
+        // A takedown lasts its clip (TdMOVE_Disarm.OnCustomAnimEnd).
+        for (i, seq) in faith_move::TAKEDOWN_ANIMS.iter().enumerate() {
+            if let Some(l) = Driver::length(arms, seq) {
+                t.takedown_clips[i] = l;
+            }
         }
         // The 180 turns follow their clips' root rotation.
         let curve = |seq: &str| self.driver.root_yaw_curve(arms, seq).unwrap_or_default();
@@ -211,7 +232,7 @@ impl Rig {
             stand: curve("StandTurn180Right"),
             air: curve("JumpTurnFly"),
             wallclimb: curve("wallrunvertical180turn"),
-            swing: curve("Swing180"),
+            swing: curve("swing180"),
         }));
     }
 }

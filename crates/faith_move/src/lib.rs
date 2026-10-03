@@ -5,20 +5,25 @@
 
 pub mod camera;
 pub mod controller;
+pub mod fixtures;
 pub mod greybox;
 pub mod locomotion;
+pub mod melee;
 pub mod look;
 pub mod moves;
 pub mod rooftops;
 pub mod springboard;
+pub mod takedown;
 pub mod tuning;
 pub mod vault;
 pub mod world;
 
 pub use camera::{CameraFx, CameraFxSettings, Shot, SpeedBlur};
 pub use look::{LookLimiter, SwanNeck};
-pub use controller::{AgainstWall, Controller, Event, Input, Melee, MeleeKind, Shimmy, State, Traverse, TraverseKind, TurnCurves, TurnKind, View};
-pub use tuning::Tuning;
+pub use controller::{AgainstWall, Controller, Event, Input, Melee, MeleeKind, MeleePhase, Shimmy, State, Traverse, TraverseKind, TurnCurves, TurnKind, View};
+pub use melee::Target;
+pub use takedown::TAKEDOWN_ANIMS;
+pub use tuning::{MeleeClips, Tuning};
 pub use vault::{Vault, VaultType, VAULT_TYPES};
 pub use world::{Aabb, Body, BoxWorld, Fixture, MeshWorld, SweepHit, World};
 
@@ -36,3 +41,5 @@ mod springboard_tests;
 mod mesh_tests;
 #[cfg(test)]
 mod rough_shapes_tests;
+#[cfg(test)]
+mod melee_tests;

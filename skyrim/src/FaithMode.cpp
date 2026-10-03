@@ -59,6 +59,75 @@ namespace faith
 		// frame's drawing, and its head (the camera is in it) hidden meanwhile.
 		std::vector<RE::NiPointer<RE::NiAVObject>> shownPieces;
 		std::vector<RE::NiPointer<RE::NiAVObject>> hiddenHead;
+		// A takedown under way (faith_takedowns): who, held where and facing which way, until her
+		// clip ends.
+		struct TakenDown
+		{
+			RE::ActorHandle actor;
+			RE::NiPoint3    at;
+			float           heading = 0.0f;  // which way their clip is placed (towards her)
+			float           from = 0.0f;     // where they faced: they turn over 0.25 s, not at once
+			std::uint32_t   anim = 0;
+			float           time = 0.0f;
+			// Its skeleton, bound to the victim side (Mirror's Edge's enemy clip), if it could be.
+			Body::Skeleton* skeleton = nullptr;
+		};
+		std::optional<TakenDown> takenDown;
+		// Victim skeletons, one per skeleton file (bound once each).
+		std::unordered_map<std::string, Body::Skeleton> victimSkeletons;
+
+		Body::Skeleton* VictimSkeleton(RE::Actor* a_actor)
+		{
+			auto*       race = a_actor->GetRace();
+			const auto* base = a_actor->GetActorBase();
+			if (!race || !faith) {
+				return nullptr;
+			}
+			const bool  female = base && base->GetSex() == RE::SEX::kFemale;
+			std::string key = race->skeletonModels[female ? RE::SEXES::kFemale : RE::SEXES::kMale].model.c_str();
+			if (key.empty()) {
+				return nullptr;
+			}
+			auto& s = victimSkeletons[key];
+			if (!s.tried) {
+				s.BindVictim(faith, a_actor);
+			}
+			return s.id >= 0 ? &s : nullptr;
+		}
+
+		// Which way the one taken down faces now: from where they did to the takedown's, eased over
+		// 0.25 s.
+		float TakenHeading()
+		{
+			const float k = std::clamp(takenDown->time / 0.25f, 0.0f, 1.0f);
+			const float e = k * k * (3.0f - 2.0f * k);
+			float       d = takenDown->heading - takenDown->from;
+			d = std::remainder(d, 2.0f * RE::NI_PI);
+			return takenDown->from + d * e;
+		}
+
+		// The victim plays Mirror's Edge's enemy side of the takedown, over its own animation.
+		void PoseVictim()
+		{
+			if (!takenDown || !takenDown->skeleton) {
+				return;
+			}
+			auto actor = takenDown->actor.get();
+			if (!actor || actor->IsDead()) {
+				return;
+			}
+			// Their side of it is placed as the game places it, facing her, from the start (its
+			// hands meet hers there); only the actor underneath turns over 0.25 s.
+			takenDown->skeleton->ApplyVictim(faith, actor->Get3D(false), takenDown->anim, takenDown->time, takenDown->at, takenDown->heading);
+		}
+		// On a course, people stand on it (only Faith collides with it): where each is held, and
+		// its character controller's gravity to give back after.
+		struct Standing
+		{
+			RE::NiPoint3 at;
+			float        gravity = 1.0f;
+		};
+		std::unordered_map<RE::FormID, Standing> standing;
 		// Where Faith last stood (the safety net if she ever drops through the world).
 		RE::NiPoint3 lastGround{};
 		bool         haveGround = false;
@@ -375,33 +444,81 @@ namespace faith
 		float holdFor = 0.0f;
 		bool  heldThisFall = false;  // once per fall: a real drop into nothing isn't held again
 
+		// Faith's world from a read of Skyrim's collision: left as it is when it's the same as last
+		// time (the usual case), else rebuilt (its grid, its ziplines and beams found again).
+		void UseCollision(std::vector<FaithFixtureCandidate>& a_candidates, bool a_force)
+		{
+			if (!GetConfig().worldFixtures) {
+				a_candidates.clear();
+			}
+			std::uint64_t hash = 1469598103934665603ull;
+			auto mix = [&](const void* a_data, std::size_t a_bytes) {
+				const auto* p = static_cast<const std::uint8_t*>(a_data);
+				for (std::size_t i = 0; i < a_bytes; ++i) {
+					hash = (hash ^ p[i]) * 1099511628211ull;
+				}
+			};
+			mix(tris.data(), tris.size() * sizeof(float));
+			mix(a_candidates.data(), a_candidates.size() * sizeof(FaithFixtureCandidate));
+			static std::uint64_t lastHash = 0;
+			if (hash == lastHash && !a_force) {
+				return;
+			}
+			lastHash = hash;
+			faith_set_fixture_candidates(faith, a_candidates.data(), static_cast<std::uint32_t>(a_candidates.size()));
+			faith_set_world(faith, tris.data(), static_cast<std::uint32_t>(tris.size() / 9));
+			// Say when the ziplines, poles and beams around her change.
+			static std::uint32_t lastFixtures = 0;
+			const auto           found = faith_world_fixtures(faith, nullptr, 0);
+			if (found != lastFixtures) {
+				std::vector<FaithFixture> list(found);
+				faith_world_fixtures(faith, list.data(), found);
+				int counts[3]{};
+				for (const auto& f : list) {
+					++counts[std::min<std::uint32_t>(f.kind, 2)];
+				}
+				logger::info("fixtures around Faith: {} ziplines, {} swing poles, {} beams (of {} thin pieces)", counts[0], counts[1], counts[2], a_candidates.size());
+				lastFixtures = found;
+			}
+		}
+
 		void RefreshCollision(RE::PlayerCharacter* a_player, bool a_force)
 		{
 			const auto& cfg = GetConfig();
-			const auto  at = a_player->GetPosition();
-			const bool  moved = at.GetDistance(collisionAt) > cfg.collisionRadius * 0.25f;
-			auto*       cell = a_player->GetParentCell();
-			const bool  newCell = cell != lastCell;
-			const bool  falling = haveFrame && frame.velocity.z < -700.0f;
+			static std::vector<FaithFixtureCandidate> candidates;
+			// A read finished in the background: Faith moves on it from now.
+			if (!a_force && Collision::TakeHarvest(tris, candidates)) {
+				UseCollision(candidates, false);
+			}
+			const auto at = a_player->GetPosition();
+			const bool moved = at.GetDistance(collisionAt) > cfg.collisionRadius * 0.25f;
+			auto*      cell = a_player->GetParentCell();
+			const bool newCell = cell != lastCell;
+			const bool falling = haveFrame && frame.velocity.z < -700.0f;
 			if (!a_force && !moved && !newCell && collisionTimer > 0.0f) {
 				return;
 			}
-			lastCell = cell;
-			// Read again sooner while falling fast or held waiting for the ground.
-			collisionTimer = falling || holdFor > 0.0f ? 0.1f : cfg.collisionRefresh;
 			// Centred a little ahead of where Faith is going, and reaching well below her (a long
 			// drop mustn't outrun it): 60 m down, more the faster she falls.
-			auto centre = haveFrame ? P(frame.feet) : at;
+			auto  centre = haveFrame ? P(frame.feet) : at;
 			float down = 4200.0f;
 			if (haveFrame) {
 				centre.x += frame.velocity.x * 0.4f;
 				centre.y += frame.velocity.y * 0.4f;
 				down += std::max(0.0f, -frame.velocity.z) * 1.5f;
 			}
-			if (Collision::Harvest(centre, cfg.collisionRadius, cfg.collisionHeight, down, tris)) {
-				faith_set_world(faith, tris.data(), static_cast<std::uint32_t>(tris.size() / 9));
-				collisionAt = centre;
+			if (a_force) {
+				// Needed now (switching on, a teleport): read here.
+				if (Collision::Harvest(centre, cfg.collisionRadius, cfg.collisionHeight, down, tris, cfg.worldFixtures ? &candidates : nullptr)) {
+					UseCollision(candidates, true);
+				}
+			} else if (!Collision::HarvestAsync(centre, cfg.collisionRadius, cfg.collisionHeight, down, cfg.worldFixtures)) {
+				return;  // one is still being read: ask again next frame
 			}
+			lastCell = cell;
+			collisionAt = centre;
+			// Read again sooner while falling fast or held waiting for the ground.
+			collisionTimer = falling || holdFor > 0.0f ? 0.25f : cfg.collisionRefresh;
 		}
 
 		void Enable(RE::PlayerCharacter* a_player)
@@ -422,14 +539,26 @@ namespace faith
 					arms.Bind(faith, a_player, true);
 				}
 			}
+			// The whole-body view needs Skyrim's body bound; without it, Skyrim's arms stand in.
+			if (view == View::kSkyrimBody && body.id < 0) {
+				if (!body.tried && faith_animated(faith)) {
+					body.Bind(faith, a_player, false);
+				}
+				if (body.id < 0) {
+					view = View::kSkyrimArms;
+				}
+			}
 			Notify("Faith: on");
 		}
 
 		void StopCourse(RE::PlayerCharacter* a_player);
+		void Sneak(RE::PlayerCharacter* a_player, float a_delta, bool a_off = false, bool a_held = false);
 
 		void Disable(RE::PlayerCharacter* a_player)
 		{
 			StopCourse(a_player);
+			Collision::Forget();
+			Sneak(a_player, 0.0f, true);
 			active = false;
 			Input::SetCapturing(false);
 			HideFirstPerson(a_player, false);
@@ -448,6 +577,285 @@ namespace faith
 				}
 			}
 			Notify("Faith: off");
+		}
+
+		// ---- Faith's attacks on Skyrim's actors
+		std::vector<FaithTarget>  targets;
+		std::vector<RE::ActorHandle> targetActors;
+
+		// Who's around her: the living actors near enough to be picked (the air kick reaches
+		// furthest, 2400 uu = 24 m), not her followers, seen from where she stands.
+		void GatherTargets(RE::PlayerCharacter* a_player, float a_delta)
+		{
+			// Five times a second: each one is a line-of-sight ray, and people don't go far in 0.2 s.
+			static float timer = 0.0f;
+			timer -= a_delta;
+			if (timer > 0.0f) {
+				return;
+			}
+			timer = 0.2f;
+			targets.clear();
+			targetActors.clear();
+			auto* lists = RE::ProcessLists::GetSingleton();
+			if (!lists) {
+				faith_set_targets(faith, nullptr, 0);
+				return;
+			}
+			const auto at = a_player->GetPosition();
+			for (auto& handle : lists->highActorHandles) {
+				auto actor = handle.get();
+				if (!actor || actor.get() == a_player || actor->IsDead() || actor->IsPlayerTeammate() || !actor->Is3DLoaded()) {
+					continue;
+				}
+				const auto pos = actor->GetPosition();
+				if (pos.GetDistance(at) > 2000.0f) {
+					continue;
+				}
+				bool unused = false;
+				if (!a_player->HasLineOfSight(actor.get(), unused)) {
+					continue;
+				}
+				const auto lo = actor->GetBoundMin();
+				const auto hi = actor->GetBoundMax();
+				const float half = std::max(actor->GetHeight(), 40.0f) * 0.5f;
+				const float radius = std::clamp(std::max(hi.x - lo.x, hi.y - lo.y) * 0.5f, 10.0f, 80.0f);
+				FaithTarget t{};
+				t.id = static_cast<std::uint32_t>(targetActors.size());
+				t.centre = { pos.x, pos.y, pos.z + half };
+				t.radius = radius;
+				t.half_height = half;
+				t.eye = half * 0.8f;
+				const float heading = actor->GetAngleZ();
+				t.facing = { std::sin(heading), std::cos(heading), 0.0f };
+				targets.push_back(t);
+				targetActors.push_back(handle);
+			}
+			faith_set_targets(faith, targets.data(), static_cast<std::uint32_t>(targets.size()));
+		}
+
+		// What landed: Mirror's Edge's damage on the actor's health, and Skyrim's own reaction (a
+		// stagger as strong as the blow, a push along it). They fight back.
+		void ApplyHits(RE::PlayerCharacter* a_player)
+		{
+			FaithHit hits[8];
+			const auto n = faith_melee_hits(faith, hits, 8);
+			for (std::uint32_t i = 0; i < n; ++i) {
+				const auto& h = hits[i];
+				if (h.target >= targetActors.size()) {
+					continue;
+				}
+				auto actor = targetActors[h.target].get();
+				if (!actor || actor->IsDead() || !GetConfig().meleeHits) {
+					continue;
+				}
+				const float damage = h.damage * GetConfig().meleeDamageMult;
+				actor->AsActorValueOwner()->DamageActorValue(RE::ActorValue::kHealth, damage);
+				const RE::NiPoint3 push{ h.momentum.x, h.momentum.y, h.momentum.z };
+				const float        speed = push.Length();
+				if (!actor->IsDead()) {
+					// Stagger as hard as the blow: 1 at 8 m/s (560 units/s) and up.
+					const float magnitude = std::clamp(speed / 560.0f, 0.25f, 1.0f);
+					const float facing = actor->GetAngleZ();
+					const float from = std::atan2(push.x, push.y);
+					float       dir = (from - facing) / (2.0f * RE::NI_PI);
+					dir -= std::floor(dir);
+					actor->SetGraphVariableFloat("staggerDirection", dir);
+					actor->SetGraphVariableFloat("staggerMagnitude", magnitude);
+					actor->NotifyAnimationGraph("staggerStart");
+					if (speed > 1.0f) {
+						actor->ApplyCurrent(0.15f, RE::hkVector4(push.x / 70.0f, push.y / 70.0f, push.z / 70.0f, 0.0f));
+					}
+					if (!actor->IsInCombat()) {
+						actor->StartCombat(a_player);
+					}
+				}
+				logger::info("Faith hit {} for {:.1f} ({} kind {}, {:.0f} units/s)", actor->GetName(), damage, actor->IsDead() ? "killed" : "staggered", h.kind, speed);
+			}
+		}
+
+		// Mirror's Edge's disarm as a takedown: at the start she takes their weapon
+		// (TakeDisarmedPawnsWeapon) and they're held where it puts them, turned to face her (or away,
+		// from behind); when her clip ends they go down.
+		void ApplyTakedowns(RE::PlayerCharacter* a_player, float a_delta)
+		{
+			if (takenDown) {
+				takenDown->time += a_delta;
+			}
+			FaithTakedown downs[4];
+			const auto n = faith_takedowns(faith, downs, 4);
+			for (std::uint32_t i = 0; i < n; ++i) {
+				const auto& d = downs[i];
+				if (d.done == 0) {
+					if (d.target >= targetActors.size() || d.target >= targets.size()) {
+						continue;
+					}
+					auto actor = targetActors[d.target].get();
+					if (!actor || actor->IsDead()) {
+						continue;
+					}
+					TakenDown t;
+					t.actor = actor->GetHandle();
+					t.at = { d.enemy_at.x, d.enemy_at.y, d.enemy_at.z - targets[d.target].half_height };
+					t.heading = std::atan2(d.enemy_dir.x, d.enemy_dir.y);
+					t.from = actor->GetAngleZ();
+					t.anim = d.anim;
+					// Humanoids play the enemy's side (Skyrim's NPC skeleton); others just stand.
+					if (actor->HasKeywordString("ActorTypeNPC")) {
+						t.skeleton = VictimSkeleton(actor.get());
+					}
+					takenDown = t;
+					for (const bool left : { false, true }) {
+						auto* weapon = actor->GetEquippedObject(left);
+						if (weapon && weapon->IsWeapon()) {
+							actor->RemoveItem(weapon->As<RE::TESBoundObject>(), 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, a_player);
+						}
+					}
+					if (!takenDown->skeleton) {
+						actor->SetGraphVariableFloat("staggerMagnitude", 0.25f);
+						actor->NotifyAnimationGraph("staggerStart");
+					}
+					logger::info("takedown on {} ({}{})", actor->GetName(), d.anim == 3 ? "from behind" : "from the front",
+						takenDown->skeleton ? ", playing the enemy's side" : "");
+				} else if (takenDown) {
+					auto actor = takenDown->actor.get();
+					takenDown.reset();
+					if (!actor || actor->IsDead()) {
+						continue;
+					}
+					if (GetConfig().takedownKills) {
+						auto* av = actor->AsActorValueOwner();
+						av->DamageActorValue(RE::ActorValue::kHealth, av->GetActorValue(RE::ActorValue::kHealth) + 10.0f);
+					} else {
+						actor->SetGraphVariableFloat("staggerMagnitude", 1.0f);
+						actor->NotifyAnimationGraph("staggerStart");
+					}
+					if (!actor->IsDead() && !actor->IsInCombat()) {
+						actor->StartCombat(a_player);
+					}
+					logger::info("takedown on {}: {}", actor->GetName(), actor->IsDead() ? "down" : "staggered");
+				}
+			}
+			if (takenDown) {
+				if (auto actor = takenDown->actor.get(); actor && !actor->IsDead()) {
+					actor->SetPosition(takenDown->at, true);
+					actor->SetHeading(TakenHeading());
+					PoseVictim();
+				} else {
+					takenDown.reset();
+				}
+			}
+		}
+
+		// Let the people on a course go: gravity back as it was.
+		void ReleaseStanding()
+		{
+			for (const auto& [id, s] : standing) {
+				auto* actor = RE::TESForm::LookupByID<RE::Actor>(id);
+				if (auto* controller = actor ? actor->GetCharController() : nullptr) {
+					controller->gravity = s.gravity;
+				}
+			}
+			standing.clear();
+		}
+
+		// A course is only Faith's collision: anyone on it (put there with placeatme, say) is
+		// stood on it where they are, without gravity, and held still. Moved elsewhere (a script,
+		// the console), they're stood again where they now are.
+		void HoldOnCourse(RE::PlayerCharacter* a_player)
+		{
+			auto* lists = RE::ProcessLists::GetSingleton();
+			if (!onCourse || !lists || !faith) {
+				ReleaseStanding();
+				return;
+			}
+			const auto  at = a_player->GetPosition();
+			const auto* takenActor = takenDown ? takenDown->actor.get().get() : nullptr;
+			for (auto& handle : lists->highActorHandles) {
+				auto actor = handle.get();
+				if (!actor || actor.get() == a_player || actor.get() == takenActor || actor->IsDead() || !actor->Is3DLoaded() ||
+					(actor->GetParentCell() != a_player->GetParentCell() && (!a_player->GetWorldspace() || actor->GetWorldspace() != a_player->GetWorldspace())) ||
+					actor->GetPosition().GetDistance(at) > 30000.0f) {
+					continue;
+				}
+				auto*      controller = actor->GetCharController();
+				const auto pos = actor->GetPosition();
+				auto       it = standing.find(actor->GetFormID());
+				const bool moved = it != standing.end() && std::hypot(pos.x - it->second.at.x, pos.y - it->second.at.y) > 150.0f;
+				if (it == standing.end() || moved) {
+					FaithVec3 ground{};
+					if (!faith_ground_below(faith, { pos.x, pos.y, pos.z + 50.0f }, 20000.0f, &ground)) {
+						continue;  // nothing of the course under them
+					}
+					Standing s;
+					s.at = { ground.x, ground.y, ground.z };
+					s.gravity = it != standing.end() ? it->second.gravity : (controller ? controller->gravity : 1.0f);
+					it = standing.insert_or_assign(actor->GetFormID(), s).first;
+					logger::info("{} stood on the course at ({:.0f} {:.0f} {:.0f})", actor->GetName(), s.at.x, s.at.y, s.at.z);
+				}
+				if (controller) {
+					controller->gravity = 0.0f;
+					controller->fallTime = 0.0f;
+					controller->fallStartHeight = it->second.at.z;
+				}
+				actor->SetPosition(it->second.at, true);
+			}
+		}
+
+		// ---- Skyrim's stamina (bStamina): Mirror's Edge has none, so this is Skyrim's rule on
+		// Faith's moves. Sprinting (past Mirror's Edge's 4 m/s run: SpeedMaxBaseVelocity),
+		// wallrunning and wallclimbing drain it at Skyrim's sprint rate; with none left she can't
+		// sprint (her controls held under Mirror's Edge's sprint threshold, 0.7) until it's back.
+		bool exhausted = false;
+
+		// Skyrim's sneaking from Faith's: holding crouch while she's low (crouched or sliding), the
+		// player sneaks for Skyrim's stealth; let go and it stops (after a moment, so a crouch-jump
+		// doesn't flicker it). While Faith is on the flag is hers, written every frame, so nothing
+		// leaves it stuck on.
+		bool  sneakSet = false;
+		float sneakLinger = 0.0f;
+		void Sneak(RE::PlayerCharacter* a_player, float a_delta, bool a_off, bool a_held)
+		{
+			auto* state = a_player->AsActorState();
+			if (a_off) {
+				if (sneakSet) {
+					state->actorState1.sneaking = 0;
+					sneakSet = false;
+				}
+				sneakLinger = 0.0f;
+				return;
+			}
+			sneakLinger = a_held && frame.low ? 0.15f : sneakLinger - a_delta;
+			state->actorState1.sneaking = sneakLinger > 0.0f ? 1 : 0;
+			sneakSet = true;
+		}
+
+		void Stamina(RE::PlayerCharacter* a_player, float a_delta)
+		{
+			if (!GetConfig().stamina || onCourse) {
+				exhausted = false;
+				return;
+			}
+			auto*                    av = a_player->AsActorValueOwner();
+			const std::string_view   state = faith_state_name(faith);
+			const float              speed = std::hypot(frame.velocity.x, frame.velocity.y);
+			const bool               sprinting = frame.on_ground && speed > 4.0f * 70.0f;
+			const bool               onWall = state.starts_with("Wallrun") || state.starts_with("Wallclimb");
+			static float             rate = -1.0f;
+			if (rate < 0.0f) {
+				auto* gs = RE::GameSettingCollection::GetSingleton();
+				auto* s = gs ? gs->GetSetting("fSprintStaminaDrainMult") : nullptr;
+				rate = s ? s->GetFloat() : 7.0f;
+			}
+			if (sprinting || onWall) {
+				av->DamageActorValue(RE::ActorValue::kStamina, rate * a_delta);
+			}
+			const float now = av->GetActorValue(RE::ActorValue::kStamina);
+			if (now <= 0.0f && !exhausted) {
+				exhausted = true;
+				Notify("Faith: out of stamina");
+			} else if (exhausted && now >= av->GetPermanentActorValue(RE::ActorValue::kStamina) * 0.25f) {
+				exhausted = false;
+			}
 		}
 
 		// Put the player on one of the app's training courses, built high above where they are.
@@ -492,6 +900,7 @@ namespace faith
 			onCourse = false;
 			Input::SetCourse(false);
 			haveGround = false;
+			ReleaseStanding();
 			if (faith) {
 				faith_course_stop(faith);
 				if (a_player) {
@@ -507,8 +916,43 @@ namespace faith
 			Notify("Faith: back from the course");
 		}
 
+		// How long the plugin's own work takes in a frame, by part: a frame over 3 ms is logged with
+		// its breakdown (at most once a second), so a hitch can be pinned on what caused it.
+		struct FrameTimer
+		{
+			using Clock = std::chrono::steady_clock;
+			Clock::time_point                       start = Clock::now(), last = start;
+			std::array<std::pair<const char*, float>, 10> parts{};
+			int                                     n = 0;
+
+			void Mark(const char* a_part)
+			{
+				const auto now = Clock::now();
+				if (n < static_cast<int>(parts.size())) {
+					parts[n++] = { a_part, std::chrono::duration<float, std::milli>(now - last).count() };
+				}
+				last = now;
+			}
+
+			~FrameTimer()
+			{
+				const float total = std::chrono::duration<float, std::milli>(Clock::now() - start).count();
+				static auto logged = Clock::now() - std::chrono::seconds(2);
+				if (total < 3.0f || Clock::now() - logged < std::chrono::seconds(1)) {
+					return;
+				}
+				logged = Clock::now();
+				std::string parts_text;
+				for (int i = 0; i < n; ++i) {
+					parts_text += std::format(" {} {:.1f},", parts[i].first, parts[i].second);
+				}
+				logger::warn("slow frame: Faith's work took {:.1f} ms (ms by part:{})", total, parts_text);
+			}
+		};
+
 		void PerFrame(RE::PlayerCharacter* a_player, float a_delta)
 		{
+			FrameTimer timer;
 			if (wantEnable && a_player->Get3D(false)) {
 				wantEnable = false;
 				Enable(a_player);
@@ -523,23 +967,16 @@ namespace faith
 			const int  wanted = menuView.exchange(-1);
 			const bool cycle = Input::TakeViewmodelToggle();
 			if (cycle || wanted >= 0) {
-				if (wanted >= 0) {
-					view = static_cast<View>(std::clamp(wanted, 0, 2));
-					if (view == View::kSkyrimBody && body.id < 0) {
-						view = View::kSkyrimArms;
-					}
+				// Two views: Faith's own body and Skyrim's whole body. (Skyrim's arms only stand in
+				// when its body couldn't be set up.)
+				const View next = wanted >= 0 ? (wanted == 0 ? View::kFaith : View::kSkyrimBody) : (view == View::kFaith ? View::kSkyrimBody : View::kFaith);
+				if (next == View::kSkyrimBody && body.id < 0 && !body.tried && faith_animated(faith)) {
+					body.Bind(faith, a_player, false);
+				}
+				if (next == View::kSkyrimBody && body.id < 0) {
+					Notify("Faith: Skyrim's body couldn't be set up (see the log)");
 				} else {
-					switch (view) {
-					case View::kFaith:
-						view = GetConfig().skyrimBody && body.id >= 0 ? View::kSkyrimBody : View::kSkyrimArms;
-						break;
-					case View::kSkyrimBody:
-						view = View::kSkyrimArms;
-						break;
-					default:
-						view = View::kFaith;
-						break;
-					}
+					view = next;
 				}
 				Viewmodel::SetVisible(view == View::kFaith);
 				// Skyrim draws its body in third person: the whole-body view uses its third-person
@@ -553,7 +990,7 @@ namespace faith
 						forcedThirdPerson = false;
 					}
 				}
-				Notify(view == View::kFaith ? "Faith: her own body" : view == View::kSkyrimBody ? "Faith: Skyrim's body" : "Faith: Skyrim's arms");
+				Notify(view == View::kFaith ? "Faith: her own body" : "Faith: Skyrim's body");
 			}
 			if (const auto walk = Input::TakeWalkChange(); walk && active) {
 				Notify(*walk ? "Faith: walking" : "Faith: running");
@@ -609,10 +1046,12 @@ namespace faith
 				Input::Take(0.0f);  // drop what was pressed meanwhile
 				return;
 			}
+			timer.Mark("setup");
 			collisionTimer -= a_delta;
 			if (!onCourse) {
 				RefreshCollision(a_player, false);
 			}
+			timer.Mark("collision");
 
 			// Nothing under her yet (a cell still streaming in, a load): hold her where she is for a
 			// moment, reading the collision again, rather than let her drop out of the world.
@@ -634,14 +1073,49 @@ namespace faith
 			}
 			if (holdFor > 0.0f) {
 				holdFor -= a_delta;
-				RefreshCollision(a_player, true);
+				RefreshCollision(a_player, false);
 				Input::Take(0.0f);
 				a_player->SetPosition(P(frame.feet), true);
 				return;
 			}
-			const auto input = Input::Take(GetConfig().mouseSensitivity);
+			timer.Mark("ground check");
+			GatherTargets(a_player, a_delta);
+			timer.Mark("targets");
+			// Doors, gates and drawbridges where they are this frame.
+			static std::vector<float> movingTris;
+			if (!onCourse && Collision::CollectMoving(movingTris)) {
+				faith_set_moving(faith, movingTris.data(), static_cast<std::uint32_t>(movingTris.size() / 9));
+			}
+			timer.Mark("moving things");
+			// What her feet and hands are on, for the step sounds (ten times a second).
+			static float surfaceTimer = 0.0f;
+			surfaceTimer -= a_delta;
+			if (haveFrame && !onCourse && surfaceTimer <= 0.0f) {
+				surfaceTimer = 0.1f;
+				const auto        feet = P(frame.feet);
+				const RE::NiPoint3 fwd{ std::sin(frame.heading), std::cos(frame.heading), 0.0f };
+				const auto        chest = feet + RE::NiPoint3{ 0.0f, 0.0f, 90.0f };
+				faith_set_surfaces(faith, Collision::SurfaceAt(feet + RE::NiPoint3{ 0.0f, 0.0f, 30.0f }, feet - RE::NiPoint3{ 0.0f, 0.0f, 60.0f }),
+					Collision::SurfaceAt(chest, chest + fwd * 80.0f));
+			}
+			timer.Mark("surfaces");
+			auto input = Input::Take(GetConfig().mouseSensitivity, a_delta);
+			if (exhausted) {
+				const float push = std::hypot(input.move_x, input.move_y);
+				if (push > 0.7f) {
+					input.move_x *= 0.7f / push;
+					input.move_y *= 0.7f / push;
+				}
+			}
 			faith_step(faith, a_delta, &input, &frame);
+			timer.Mark("Faith's step");
 			haveFrame = true;
+			ApplyHits(a_player);
+			ApplyTakedowns(a_player, a_delta);
+			HoldOnCourse(a_player);
+			Stamina(a_player, a_delta);
+			Sneak(a_player, a_delta, false, input.crouch_held != 0);
+			timer.Mark("hits, stamina");
 
 			// The safety net: dropped 40 m below where she last stood (through a hole in the
 			// collision), she's put back there.
@@ -700,7 +1174,18 @@ namespace faith
 			}
 			if (body.id >= 0) {
 				// Seen from her camera, the body's shoulders sit where Faith's do against it.
-				body.Apply(faith, a_player->Get3D(false), ShowingSkyrimBody(a_player) ? FAITH_POSE_PIN_HANDS : 0u);
+				// Seen from her camera, the arms reach her hands, where hers appear on screen.
+				std::uint32_t flags = 0;
+				if (ShowingSkyrimBody(a_player)) {
+					flags = FAITH_POSE_PIN_HANDS;
+					if (GetConfig().bodyScreenMatch) {
+						if (auto* camera = RE::PlayerCamera::GetSingleton()) {
+							faith_set_screen_scale(faith, Viewmodel::BodyScreenScale(frame, camera->GetRuntimeData2().worldFOV));
+							flags |= FAITH_POSE_SCREEN_MATCH;
+						}
+					}
+				}
+				body.Apply(faith, a_player->Get3D(false), flags);
 			}
 			if (arms.id >= 0) {
 				// With her own body drawn, Skyrim's hidden hands go exactly onto hers, so what they
@@ -738,7 +1223,7 @@ namespace faith
 			}
 			auto*       root = a_camera->cameraRoot.get();
 			const auto& R = root->world.rotate;
-			if (!axesKnown && !axesRejected) {
+			if (!axesKnown && !axesRejected && a_camera->IsInFirstPerson() && view != View::kSkyrimBody) {
 				// Skyrim built this from the angles we gave the player: compare it to that look.
 				const float h = frame.heading, p = frame.pitch;
 				const RE::NiPoint3 f{ std::sin(h) * std::cos(p), std::cos(h) * std::cos(p), std::sin(p) };
@@ -760,20 +1245,44 @@ namespace faith
 					}
 				}
 				if (++axisSamples >= 120) {
-					bool                ok = true;
-					std::array<bool, 3> used{};
+					// Each column's clear winner (over 60% of the samples), if it has one.
+					std::array<int, 3> pick{ -1, -1, -1 };
 					for (int c = 0; c < 3; ++c) {
 						const auto it = std::ranges::max_element(axisVotes[c]);
-						const int  k = static_cast<int>(it - axisVotes[c].begin());
-						ok &= *it > axisSamples * 6 / 10 && !used[k / 2];
-						used[k / 2] = true;
-						axisMap[c] = k;
+						if (*it > axisSamples * 6 / 10) {
+							pick[c] = static_cast<int>(it - axisVotes[c].begin());
+						}
+					}
+					const auto distinct = [&](int a, int b) { return pick[a] < 0 || pick[b] < 0 || pick[a] / 2 != pick[b] / 2; };
+					const int  clear = (pick[0] >= 0) + (pick[1] >= 0) + (pick[2] >= 0);
+					bool       ok = clear >= 2 && distinct(0, 1) && distinct(0, 2) && distinct(1, 2);
+					if (ok && clear == 2) {
+						// Two are clear: the third is the axis left over, signed so the frame stays
+						// right-handed (as every rotation is).
+						const int missing = pick[0] < 0 ? 0 : pick[1] < 0 ? 1 : 2;
+						int       axis = 0;
+						while (axis == pick[(missing + 1) % 3] / 2 || axis == pick[(missing + 2) % 3] / 2) {
+							++axis;
+						}
+						const std::array<RE::NiPoint3, 6> unit{ RE::NiPoint3{ 0, 1, 0 }, RE::NiPoint3{ 0, -1, 0 }, RE::NiPoint3{ 0, 0, 1 }, RE::NiPoint3{ 0, 0, -1 },
+							RE::NiPoint3{ 1, 0, 0 }, RE::NiPoint3{ -1, 0, 0 } };
+						const auto col = [&](int c, int k) { return c == missing ? unit[k] : unit[pick[c]]; };
+						pick[missing] = axis * 2;
+						if (col(0, pick[missing]).Cross(col(1, pick[missing])).Dot(col(2, pick[missing])) < 0.0f) {
+							pick[missing] = axis * 2 + 1;
+						}
 					}
 					static constexpr const char* kNames[6] = { "+forward", "-forward", "+up", "-up", "+right", "-right" };
-					axesKnown = ok;
-					axesRejected = !ok;
-					logger::info("camera root axes: {} {} {} -> {}", kNames[axisMap[0]], kNames[axisMap[1]], kNames[axisMap[2]],
-						ok ? "Faith's camera turns it" : "inconsistent; only placing it");
+					if (ok) {
+						axisMap = { pick[0], pick[1], pick[2] };
+					} else {
+						// The camera root is a plain node in Skyrim's world convention: x right,
+						// y forward, z up.
+						axisMap = { 4, 0, 2 };
+					}
+					logger::info("camera root axes: {} {} {} ({} clear) -> {}", kNames[axisMap[0]], kNames[axisMap[1]], kNames[axisMap[2]], clear,
+						ok ? "Faith's camera turns it" : "unclear; using the node convention (right, forward, up)");
+					axesKnown = true;
 				}
 			}
 			if (axesKnown) {
@@ -868,6 +1377,7 @@ namespace faith
 			}
 			ApplyCamera(camera);
 			ApplyPose(player);
+			PoseVictim();  // after its own animation, before it's drawn
 			if (camera->IsInFirstPerson()) {
 				if (auto* drawn = RE::Main::WorldRootCamera()) {
 					// NiCamera: column 0 looks, 1 is up, 2 right.
@@ -1005,7 +1515,7 @@ namespace faith
 	void Install()
 	{
 		const auto& cfg = GetConfig();
-		view = cfg.faithViewmodel ? View::kFaith : cfg.skyrimBody ? View::kSkyrimBody : View::kSkyrimArms;
+		view = cfg.faithViewmodel ? View::kFaith : View::kSkyrimBody;
 		Viewmodel::SetVisible(view == View::kFaith);
 		faith = faith_create(cfg.mirrorsEdgeDir.empty() ? nullptr : cfg.mirrorsEdgeDir.c_str(), 0.0f);
 		if (!faith) {
@@ -1055,9 +1565,21 @@ namespace faith
 			const auto* code = reinterpret_cast<const std::uint8_t*>(site);
 			std::int32_t rel = 0;
 			std::memcpy(&rel, code + 1, 4);
-			if (code[0] == 0xE8 && site + 5 + static_cast<std::intptr_t>(rel) == REL::ID(107142).address()) {
+			const auto target = site + 5 + static_cast<std::intptr_t>(rel);
+			if (code[0] == 0xE8) {
+				// Another plugin may have hooked this call first: going through its hook still ends
+				// in Main::RenderWorld.
 				RenderWorldHook::func = SKSE::GetTrampoline().write_call<5>(site, RenderWorldHook::thunk);
-				logger::info("hooked before Main::RenderWorld");
+				if (target == REL::ID(107142).address()) {
+					logger::info("hooked before Main::RenderWorld");
+				} else {
+					HMODULE mod = nullptr;
+					char    name[MAX_PATH] = "?";
+					if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(target), &mod)) {
+						GetModuleFileNameA(mod, name, MAX_PATH);
+					}
+					logger::info("hooked before Main::RenderWorld (through another plugin's hook of it: {})", name);
+				}
 			} else {
 				logger::warn("Main::RenderWorld's call isn't where expected; the pose is only set in the update hooks");
 			}
@@ -1083,11 +1605,18 @@ namespace faith
 		body.Reset();
 		arms.Reset();
 		haveFrame = false;
+		Collision::Forget();
+		if (faith) {
+			faith_set_moving(faith, nullptr, 0);
+		}
 		if (onCourse && faith) {
 			faith_course_stop(faith);
 		}
 		onCourse = false;
 		Input::SetCourse(false);
+		standing.clear();
+		takenDown.reset();
+		victimSkeletons.clear();
 		if (loadedReturn) {
 			// Saved on a training course: back to where it was started from.
 			if (auto* player = RE::PlayerCharacter::GetSingleton()) {
@@ -1139,7 +1668,10 @@ namespace faith
 			}
 		}
 
-		void OnRevert(SKSE::SerializationInterface*) { loadedReturn.reset(); }
+		void OnRevert(SKSE::SerializationInterface*)
+		{
+			loadedReturn.reset();
+		}
 	}
 
 	void RegisterSaves()

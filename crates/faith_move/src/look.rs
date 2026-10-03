@@ -72,6 +72,8 @@ pub fn look_limit(c: &Controller) -> LookLimit {
         State::ZipLine { .. } => l(-2500, 32768, Some(7000)),
         // TdMove_SwingJump's range (the swing itself doesn't clamp)
         State::Swing { .. } => l(-11000, 16384, None),
+        // TdMOVE_Disarm: bConstrainLook off (the look input is ignored instead)
+        State::Takedown { .. } => FREE,
     }
 }
 

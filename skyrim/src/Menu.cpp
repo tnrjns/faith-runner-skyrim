@@ -79,18 +79,35 @@ namespace faith::Menu
 			Tooltip("Happens when you close the menu.");
 
 			ImGuiMCP::SeparatorText("First person");
-			const char* views[] = { "Faith's own body", "Skyrim's whole body", "Skyrim's arms" };
-			int         view = CurrentView();
-			if (ImGuiMCP::Combo("View", &view, views, 3)) {
+			const char* views[] = { "Faith's own body", "Skyrim's whole body" };
+			int         view = std::min(CurrentView(), 1);
+			if (ImGuiMCP::Combo("View", &view, views, 2)) {
 				RequestView(view);
 				c.faithViewmodel = view == 0;
-				c.skyrimBody = view != 2;
 				dirty = true;
 			}
-			Tooltip("Also what you start in. The view key goes round them in game.");
+			Tooltip("Also what you start in. The view key switches between them in game.");
 			Changed(ImGuiMCP::Checkbox("Speed blur when running fast", &c.speedBlur));
+			Changed(ImGuiMCP::Checkbox("Weapons in her grip", &c.heldInGrip));
+			Tooltip("In her own body view, what Skyrim's hands hold shows in front of her arms, so her fingers close round it.");
 			Changed(ImGuiMCP::Checkbox("Animate the third-person body too", &c.thirdPersonBody));
 			Tooltip("Takes effect the next time Faith is switched on.");
+
+			ImGuiMCP::SeparatorText("The world");
+			Changed(ImGuiMCP::Checkbox("Ziplines, swing poles and beams in Skyrim", &c.worldFixtures));
+			Tooltip("Skyrim's own cables, high bars and planks over drops work as Mirror's Edge's: found in the collision around you.");
+
+			Changed(ImGuiMCP::Checkbox("Use Skyrim's stamina", &c.stamina));
+			Tooltip("Sprinting, wallruns and wallclimbs drain stamina at Skyrim's sprint rate; with none left she can't sprint. Mirror's Edge has no stamina: off is the game's way.");
+
+			ImGuiMCP::SeparatorText("Combat");
+			Changed(ImGuiMCP::Checkbox("Attacks land on people", &c.meleeHits));
+			Tooltip("Mirror's Edge's own hit tests and damage: a punch lands on someone close in front, kicks when the limb reaches them.");
+			Changed(ImGuiMCP::SliderFloat("Damage", &c.meleeDamageMult, 0.25f, 4.0f, "x %.2f"));
+			Tooltip("x Mirror's Edge's damage, taken as Skyrim health: punch 33.5, air kick 60-100, slide kick 60, wallrun kick 80.");
+			Changed(ImGuiMCP::Checkbox("Takedowns finish them", &c.takedownKills));
+			Tooltip("Mirror's Edge's disarm (the takedown key, right stick on a pad): she takes their weapon, and at the end they go down. "
+					"Off: they're staggered and fight on. Essential characters only go down to their knees.");
 
 			ImGuiMCP::SeparatorText("Idles");
 			if (ImGuiMCP::Button("Play an idle")) {
@@ -108,10 +125,33 @@ namespace faith::Menu
 			Tooltip("With walking toggled on (Caps Lock): the keys as this much of a stick. Mirror's Edge sprints only with the stick right forward.");
 
 			ImGuiMCP::SeparatorText("Skyrim's whole body");
+			Changed(ImGuiMCP::Checkbox("Hands where Faith's appear on screen", &c.bodyScreenMatch));
+			Tooltip("Faith's arms are drawn with Mirror's Edge's 100-degree view; Skyrim's body with the world's. On: its hands are put as far across the screen as hers appear (when they're in view), so it looks like her arms. Off: exactly where hers are in the world.");
 			Changed(ImGuiMCP::SliderFloat("Camera ahead of the eyes", &c.bodyCameraForward, 0.0f, 15.0f, "%.1f units"));
 			Tooltip("Keeps the camera out in front of the neck and collar.");
 			Changed(ImGuiMCP::SliderFloat("More looking down", &c.bodyCameraForwardDown, 0.0f, 25.0f, "%.1f units"));
 			Tooltip("Keeps it out of the chest when you look down at your feet.");
+
+			ImGuiMCP::SeparatorText("Reset");
+			// Two clicks within 3 seconds, so a stray one can't wipe your keys.
+			static double armed = -10.0, doneAt = -10.0;
+			const double  now = ImGuiMCP::GetTime();
+			const bool    confirming = now - armed < 3.0;
+			if (ImGuiMCP::Button(confirming ? "Click again to reset everything" : "Reset all settings")) {
+				if (confirming) {
+					ResetConfig();
+					dirty = false;
+					armed = -10.0;
+					doneAt = now;
+				} else {
+					armed = now;
+				}
+			}
+			Tooltip("Every setting and key back to how Faith Runner ships, saved to FaithSkyrim.ini. Your Mirror's Edge folder is kept.");
+			if (now - doneAt < 3.0) {
+				ImGuiMCP::SameLine();
+				ImGuiMCP::Text("Settings reset.");
+			}
 		}
 
 		std::string TimeText(float a_t)
@@ -194,6 +234,8 @@ namespace faith::Menu
 			KeyPicker("Switch Faith on and off", c.toggleKey);
 			KeyPicker("First-person view", c.viewmodelKey);
 			KeyPicker("Play an idle", c.idleKey);
+			KeyPicker("Takedown", c.takedownKey);
+			Tooltip("Mirror's Edge's disarm on whoever's close in front of her: from behind, or a snatch from the front.");
 			KeyPicker("Walk (toggle)", c.walkKey);
 			KeyPicker("Back to the checkpoint (on a course)", c.respawnKey);
 			KeyPicker("Survey the collision", c.surveyKey);

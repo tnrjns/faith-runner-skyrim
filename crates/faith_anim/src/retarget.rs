@@ -101,12 +101,54 @@ pub struct AnchorSpec {
     pub optional: bool,
 }
 
+/// An arm the host's hand is reached along exactly onto Faith's (two-bone IK): the host's upper
+/// arm and forearm bones (the first of each the main bone, the rest the twist bones that turn
+/// with it), its hand, and Faith's hand and elbow.
+pub struct IkSpec {
+    pub upper: &'static [&'static str],
+    pub lower: &'static [&'static str],
+    pub hand: &'static str,
+    pub me_hand: &'static str,
+    pub me_elbow: &'static str,
+}
+
+struct Ik {
+    upper: Vec<usize>,
+    lower: Vec<usize>,
+    hand: usize,
+    me_hand: usize,
+    me_elbow: usize,
+}
+
+/// Where a two-bone chain's middle joint goes: from `s`, bones `a` then `b` long, reaching for
+/// `t`, bending towards `pole`. The reach is held just inside what the bones span.
+pub fn two_bone_elbow(s: Vec3, t: Vec3, pole: Vec3, a: f32, b: f32) -> Vec3 {
+    let to = t - s;
+    let d = to.length().clamp((a - b).abs() + 1e-3, a + b - 1e-3);
+    let u = to.normalize_or(Vec3::X);
+    let mut v = (pole - s) - u * (pole - s).dot(u);
+    if v.length_squared() < 1e-8 {
+        v = u.any_orthonormal_vector();
+    }
+    let v = v.normalize();
+    let cos = ((a * a + d * d - b * b) / (2.0 * a * d)).clamp(-1.0, 1.0);
+    s + u * (a * cos) + v * (a * (1.0 - cos * cos).max(0.0).sqrt())
+}
+
 /// Faith's lower body: placed with the legs' facing, not the upper body's (they're separate
 /// meshes on one skeleton in Mirror's Edge).
 const LEGS: [&str; 13] = [
     "Hips", "Spine", "Spine1", "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase", "LeftUpLegRoll", "RightUpLeg", "RightLeg", "RightFoot",
     "RightToeBase", "RightUpLegRoll",
 ];
+
+/// Where one of Faith's bones is in faith_move's world this frame (her attacks sweep a limb).
+pub fn bone_position(arms: &FaithArms, globals: &[Mat4], place: &Placement, name: &str) -> Option<Vec3> {
+    let b = arms.bone(name)?;
+    let g = globals.get(b)?;
+    let rot = if LEGS.iter().any(|l| l.eq_ignore_ascii_case(name)) { place.legs_rot } else { place.body_rot };
+    Some(place.origin + rot * pose::to_view(g.w_axis.truncate()))
+}
 
 /// Where the body is this frame (faith_move's world): see `RigFrame`.
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +181,7 @@ pub struct Retarget {
     links: Vec<Option<Link>>,
     anchors: Vec<Anchor>,
     frame: HostFrame,
+    ik: Vec<Ik>,
 }
 
 /// Name compare ignoring case and Skyrim's bracketed short codes ("NPC L Hand [LHnd]").
@@ -239,7 +282,30 @@ impl Retarget {
                 Some(Anchor { optional: a.optional, bone, me, legs: LEGS.contains(&a.me), carrier, scale: if a.scaled { ratio } else { 1.0 } })
             })
             .collect();
-        Retarget { bones, links: out, anchors, frame }
+        Retarget { bones, links: out, anchors, frame, ik: vec![] }
+    }
+
+    /// Reach these arms' hands exactly onto Faith's whenever the optional anchors are asked for
+    /// (the body seen from her camera, the hidden first-person arms under hers): the host's arm
+    /// keeps its own lengths and bends at the elbow, in the plane Faith's elbow makes, instead
+    /// of its hand landing short of or past hers.
+    pub fn with_arm_ik(mut self, arms: &FaithArms, specs: &[IkSpec]) -> Self {
+        let idx = |n: &str| {
+            let s = stem(n);
+            self.bones.iter().position(|b| stem(&b.name) == s)
+        };
+        let mut ik = Vec::new();
+        for s in specs {
+            let upper: Vec<usize> = s.upper.iter().filter_map(|n| idx(n)).collect();
+            let lower: Vec<usize> = s.lower.iter().filter_map(|n| idx(n)).collect();
+            let (Some(hand), Some(me_hand), Some(me_elbow)) = (idx(s.hand), arms.bone(s.me_hand), arms.bone(s.me_elbow)) else { continue };
+            if upper.is_empty() || lower.is_empty() {
+                continue;
+            }
+            ik.push(Ik { upper, lower, hand, me_hand, me_elbow });
+        }
+        self.ik = ik;
+        self
     }
 
     pub fn bones(&self) -> &[BoneRest] {
@@ -264,6 +330,15 @@ impl Retarget {
 
     /// [`Self::pose`], with the optional anchors too (`optional`).
     pub fn pose_with(&self, me: &[Mat4], place: &Placement, root_parent: Xform, optional: bool, out: &mut Vec<Xform>) {
+        self.pose_seen(me, place, root_parent, optional, None, out)
+    }
+
+    /// [`Self::pose_with`], the arms' targets seen through another field of view: `seen` is
+    /// Faith's camera (faith_move's frame) and how much narrower the view the body is drawn with
+    /// is than her arms' (tan(its half angle) / tan(theirs)). Her hands are placed as far across
+    /// the screen as hers appear (Mirror's Edge draws her arms at its own 100 degrees), at
+    /// the same depth.
+    pub fn pose_seen(&self, me: &[Mat4], place: &Placement, root_parent: Xform, optional: bool, seen: Option<(Vec3, Quat, f32)>, out: &mut Vec<Xform>) {
         let f = &self.frame;
         let placed = |legs: bool| if legs { place.legs_rot } else { place.body_rot };
         let world_rot = |l: &Link| f.rot(placed(l.legs) * Quat::from_mat4(&me[l.me]).normalize()) * l.offset;
@@ -271,24 +346,79 @@ impl Retarget {
         out.clear();
         out.extend(self.bones.iter().map(|b| Xform { rot: b.rot, pos: b.pos, scale: b.scale }));
         let mut world = vec![Xform::IDENTITY; self.bones.len()];
-        let solve = |out: &mut Vec<Xform>, world: &mut Vec<Xform>| {
+        // The arm IK's turns, on top of Faith's rotations (identity for every other bone).
+        let mut corr = vec![Quat::IDENTITY; self.bones.len()];
+        let solve = |out: &mut Vec<Xform>, world: &mut Vec<Xform>, corr: &[Quat]| {
             for (i, b) in self.bones.iter().enumerate() {
                 let parent = b.parent.map_or(root_parent, |p| world[p]);
                 if let Some(l) = &self.links[i] {
-                    out[i].rot = (parent.rot.inverse() * world_rot(l)).normalize();
+                    out[i].rot = (parent.rot.inverse() * (corr[i] * world_rot(l))).normalize();
                 }
                 world[i] = parent.then(&out[i]);
             }
         };
-        solve(out, &mut world);
-        for a in self.anchors.iter().filter(|a| optional || !a.optional) {
+        solve(out, &mut world, &corr);
+        // A hand the arm IK reaches is pinned after it (only what the arm can't reach is left).
+        let ik_hand = |a: &&Anchor| self.ik.iter().any(|k| k.hand == a.bone);
+        let pin = |a: &Anchor, out: &mut Vec<Xform>, world: &mut Vec<Xform>, corr: &[Quat]| {
             let me_at = f.point(place.origin + placed(a.legs) * pose::to_view(me[a.me].w_axis.truncate()));
             let target = origin + (me_at - origin) * a.scale;
             let delta = target - world[a.bone].pos;
             let c = a.carrier;
             let parent = self.bones[c].parent.map_or(root_parent, |p| world[p]);
             out[c].pos += parent.rot.inverse() * delta / parent.scale;
-            solve(out, &mut world);
+            solve(out, world, corr);
+        };
+        for a in self.anchors.iter().filter(|a| (optional || !a.optional) && !(optional && ik_hand(a))) {
+            pin(a, out, &mut world, &corr);
+        }
+        if !optional {
+            return;
+        }
+        let me_at = |m: usize| {
+            let p = f.point(place.origin + place.body_rot * pose::to_view(me[m].w_axis.truncate()));
+            match seen {
+                Some((cam, rot, k)) => {
+                    // The camera's turn takes its own axes (right x, up y, back z) to faith_move's;
+                    // to the host's, add the frame's axes after it.
+                    let (c, r) = (f.point(cam), f.axes * rot);
+                    let v = r.inverse() * (p - c);
+                    // Only what's in front of the view is on screen to match: full within ~53
+                    // degrees of where she looks, none past ~72 (hands hanging at her sides stay
+                    // where they are).
+                    let ahead = (-v.z / v.length().max(1e-4)).clamp(-1.0, 1.0);
+                    let w = ((ahead - 0.3) / 0.3).clamp(0.0, 1.0);
+                    let s = 1.0 - w * (1.0 - k);
+                    c + r * Vec3::new(v.x * s, v.y * s, v.z)
+                }
+                None => p,
+            }
+        };
+        for arm in &self.ik {
+            let (u, l) = (arm.upper[0], arm.lower[0]);
+            let s = world[u].pos;
+            let a = (world[l].pos - s).length();
+            let b = (world[arm.hand].pos - world[l].pos).length();
+            if a < 1e-4 || b < 1e-4 {
+                continue;
+            }
+            let target = me_at(arm.me_hand);
+            let elbow = two_bone_elbow(s, target, me_at(arm.me_elbow), a, b);
+            // Turn the upper arm so the elbow lands there, then the forearm so the hand does.
+            let turn = Quat::from_rotation_arc((world[l].pos - s).normalize(), (elbow - s).normalize());
+            for &i in &arm.upper {
+                corr[i] = turn * corr[i];
+            }
+            solve(out, &mut world, &corr);
+            let e = world[l].pos;
+            let turn = Quat::from_rotation_arc((world[arm.hand].pos - e).normalize(), (target - e).normalize_or(world[arm.hand].pos - e));
+            for &i in &arm.lower {
+                corr[i] = turn * corr[i];
+            }
+            solve(out, &mut world, &corr);
+        }
+        for a in self.anchors.iter().filter(|a| a.optional && ik_hand(a)) {
+            pin(a, out, &mut world, &corr);
         }
     }
 }
@@ -342,6 +472,37 @@ pub fn skyrim_links() -> Vec<LinkSpec> {
     v
 }
 
+/// Skyrim's whole body from another of the game's characters (the disarm's victim, a cop): as
+/// [`skyrim_links`], but a third-person skeleton has a real Spine2 where Faith's first-person
+/// one has SpineX.
+pub fn skyrim_npc_links() -> Vec<LinkSpec> {
+    let mut v = skyrim_links();
+    for l in &mut v {
+        if stem(l.host) == "npc spine2" {
+            l.me = "Spine2";
+            l.aim = Some(("Spine2", "Neck", "NPC Neck"));
+        }
+    }
+    v
+}
+
+/// The victim's body: only the hips carry it, scaled to its legs.
+pub fn skyrim_npc_anchors() -> Vec<AnchorSpec> {
+    vec![AnchorSpec { host: "NPC Pelvis", me: "Hips", carry_body: true, scaled: true, optional: false }]
+}
+
+/// Another character's pose from one of its clips at `time` (model space, as
+/// `Driver::globals`): the disarm's victim side.
+pub fn clip_globals(who: &FaithArms, seq: &str, time: f32, out: &mut Vec<Mat4>) -> bool {
+    let Some(s) = who.anims.sequences.get(seq) else { return false };
+    let map = pose::TrackMap::new(&who.mesh, &who.anims);
+    let rest = Pose::rest(&who.mesh);
+    let mut p = rest.clone();
+    pose::sample(s, &map, &rest, time, false, &mut p);
+    pose::globals(&who.mesh, &p, out);
+    true
+}
+
 /// The third-person body: the hips carry it, scaled to its legs.
 pub fn skyrim_body_anchors() -> Vec<AnchorSpec> {
     vec![
@@ -362,5 +523,25 @@ pub fn skyrim_arms_anchors() -> Vec<AnchorSpec> {
         // what they hold (Skyrim's weapons) is in her grip.
         AnchorSpec { host: "NPC L Hand", me: "LeftHand", carry_body: false, scaled: false, optional: true },
         AnchorSpec { host: "NPC R Hand", me: "RightHand", carry_body: false, scaled: false, optional: true },
+    ]
+}
+
+/// Skyrim's arms reached onto Faith's hands.
+pub fn skyrim_arm_ik() -> Vec<IkSpec> {
+    vec![
+        IkSpec {
+            upper: &["NPC L UpperArm", "NPC L UpperarmTwist1", "NPC L UpperarmTwist2"],
+            lower: &["NPC L Forearm", "NPC L ForearmTwist1", "NPC L ForearmTwist2"],
+            hand: "NPC L Hand",
+            me_hand: "LeftHand",
+            me_elbow: "LeftForeArm",
+        },
+        IkSpec {
+            upper: &["NPC R UpperArm", "NPC R UpperarmTwist1", "NPC R UpperarmTwist2"],
+            lower: &["NPC R Forearm", "NPC R ForearmTwist1", "NPC R ForearmTwist2"],
+            hand: "NPC R Hand",
+            me_hand: "RightHand",
+            me_elbow: "RightForeArm",
+        },
     ]
 }

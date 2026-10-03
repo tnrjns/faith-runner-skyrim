@@ -96,6 +96,11 @@ fn retargets_onto_its_own_skeleton() {
 /// A Skyrim-named skeleton built on Faith's rest pose: Skyrim's hierarchy (COM, a Spine2
 /// between Spine1 and the neck) and bone frames turned every which way.
 fn skyrim_skeleton(arms: &FaithArms, f: HostFrame) -> Vec<BoneRest> {
+    skyrim_skeleton_on(arms, f, "SpineX")
+}
+
+/// The same, on any of the game's skeletons (`spine2`: the bone Skyrim's Spine2 rests like).
+fn skyrim_skeleton_on(arms: &FaithArms, f: HostFrame, spine2: &str) -> Vec<BoneRest> {
     let mut g = vec![];
     pose::globals(&arms.mesh, &Pose::rest(&arms.mesh), &mut g);
     let me_pos = |n: &str| f.point(to_view(g[arms.bone(n).unwrap()].w_axis.truncate()));
@@ -108,7 +113,7 @@ fn skyrim_skeleton(arms: &FaithArms, f: HostFrame) -> Vec<BoneRest> {
         ("NPC Pelvis [Pelv]".into(), Some("NPC COM [COM ]"), me_pos("Hips"), "Hips"),
         ("NPC Spine [Spn0]".into(), Some("NPC Pelvis [Pelv]"), me_pos("Spine"), "Spine"),
         ("NPC Spine1 [Spn1]".into(), Some("NPC Spine [Spn0]"), me_pos("Spine1"), "Spine1"),
-        ("NPC Spine2 [Spn2]".into(), Some("NPC Spine1 [Spn1]"), (me_pos("Spine1") + me_pos("Neck")) * 0.5, "SpineX"),
+        ("NPC Spine2 [Spn2]".into(), Some("NPC Spine1 [Spn1]"), (me_pos("Spine1") + me_pos("Neck")) * 0.5, spine2),
         ("NPC Neck [Neck]".into(), Some("NPC Spine2 [Spn2]"), me_pos("Neck"), "Neck"),
         ("NPC Head [Head]".into(), Some("NPC Neck [Neck]"), me_pos("Head"), "Head"),
     ];
@@ -259,4 +264,220 @@ fn hands_pin_onto_faiths_when_asked() {
     }
     // The bones here are Faith's own lengths, so free hands are close anyway; the pin is exact.
     assert!((hand(&free, "L") - hand(&pinned, "L")).length() < 5.0);
+}
+
+/// from her camera its hands still land exactly on hers, the elbows bending her way.
+#[test]
+fn arm_ik_reaches_faiths_hands_with_other_arm_lengths() {
+    let Some(arms) = arms() else { return };
+    let f = HostFrame::skyrim();
+    let mut bones = skyrim_skeleton(&arms, f);
+    for (name, k) in [("Forearm", 1.2), ("Hand", 0.85)] {
+        for s in ["L", "R"] {
+            let i = bones.iter().position(|b| b.name == format!("NPC {s} {name}")).unwrap();
+            bones[i].pos *= k;
+        }
+    }
+    let plain = Retarget::new(bones.clone(), f, &arms, &retarget::skyrim_links(), &retarget::skyrim_body_anchors());
+    let r = Retarget::new(bones, f, &arms, &retarget::skyrim_links(), &retarget::skyrim_body_anchors()).with_arm_ik(&arms, &retarget::skyrim_arm_ik());
+    let (me, place) = animated(&arms);
+    let root = Xform { rot: Quat::IDENTITY, pos: f.point(place.origin), scale: 1.0 };
+    let at = |r: &Retarget, local: &[Xform], n: &str| {
+        let w = worlds(r, local, root);
+        w[r.bones().iter().position(|b| b.name == n).unwrap()].pos
+    };
+    let faith = |n: &str| f.point(place.origin + place.body_rot * to_view(me[arms.bone(n).unwrap()].w_axis.truncate()));
+    let (mut a, mut b) = (vec![], vec![]);
+    plain.pose_with(&me, &place, root, true, &mut a);
+    r.pose_with(&me, &place, root, true, &mut b);
+    for (s, m) in [("L", "Left"), ("R", "Right")] {
+        let want = faith(&format!("{m}Hand"));
+        let off_plain = (at(&plain, &a, &format!("NPC {s} Hand")) - want).length();
+        let off_ik = (at(&r, &b, &format!("NPC {s} Hand")) - want).length();
+        assert!(off_plain > 1.0, "{s}: without IK the hand should miss ({off_plain})");
+        assert!(off_ik < 0.5, "{s}: hand {off_ik} units off Faith's");
+        // The elbow bends to the same side of the shoulder-hand line as hers.
+        let sh = at(&r, &b, &format!("NPC {s} UpperArm"));
+        let line = (want - sh).normalize();
+        let side = |p: Vec3| {
+            let d = p - sh;
+            d - line * d.dot(line)
+        };
+        let host_elbow = side(at(&r, &b, &format!("NPC {s} Forearm")));
+        let her_elbow = side(faith(&format!("{m}ForeArm")));
+        assert!(host_elbow.dot(her_elbow) > 0.0, "{s}: elbow bends the other way");
+    }
+}
+
+/// appear through her arms' wider one: the same direction scaled by k, the same depth.
+#[test]
+fn arm_ik_matches_faiths_hands_on_screen() {
+    let Some(arms) = arms() else { return };
+    let f = HostFrame::skyrim();
+    let r = Retarget::new(skyrim_skeleton(&arms, f), f, &arms, &retarget::skyrim_links(), &retarget::skyrim_body_anchors()).with_arm_ik(&arms, &retarget::skyrim_arm_ik());
+    let (me, place) = animated(&arms);
+    let root = Xform { rot: Quat::IDENTITY, pos: f.point(place.origin), scale: 1.0 };
+    let cam = place.origin + place.body_rot * Vec3::new(0.0, 1.6, 0.0);
+    // Looking down at her hands (they hang at her sides): in front of the view, on screen.
+    let rot = place.body_rot * Quat::from_rotation_x(-1.25);
+    let k = 0.7;
+    let mut local = vec![];
+    r.pose_seen(&me, &place, root, true, Some((cam, rot, k)), &mut local);
+    let w = worlds(&r, &local, root);
+    let in_view = |p: Vec3| (f.axes * rot).inverse() * (p - f.point(cam));
+    for (s, m) in [("L", "LeftHand"), ("R", "RightHand")] {
+        let host = in_view(w[r.bones().iter().position(|b| b.name == format!("NPC {s} Hand")).unwrap()].pos);
+        let her = in_view(f.point(place.origin + place.body_rot * to_view(me[arms.bone(m).unwrap()].w_axis.truncate())));
+        let ahead = -her.z / her.length();
+        assert!(ahead > 0.6, "{s}: the hand should be well in view ({ahead})");
+        assert!((host.z - her.z).abs() < 0.5, "{s}: depth {} vs {}", host.z, her.z);
+        assert!((host.x - her.x * k).abs() < 0.5 && (host.y - her.y * k).abs() < 0.5, "{s}: {host} vs {} x {k}", her);
+    }
+}
+
+/// The whole-body view as the plugin poses it, every frame through stand / look / run / jump
+/// (run with --ignored --nocapture): how close the body gets to the camera (near-clip popping)
+/// and how much it jumps about against the camera from frame to frame (shaking).
+#[test]
+#[ignore]
+fn body_view_flicker_report() {
+    use faith_move::{greybox, CameraFx, Controller, Input, State, Tuning};
+    let Some(arms) = arms() else { return };
+    let f = HostFrame::skyrim();
+    let mut bones = skyrim_skeleton(&arms, f);
+    for b in &mut bones {
+        b.pos *= 1.08;
+    }
+    let r = Retarget::new(bones, f, &arms, &retarget::skyrim_links(), &retarget::skyrim_body_anchors()).with_arm_ik(&arms, &retarget::skyrim_arm_ik());
+    let idx = |n: &str| r.bones().iter().position(|b| b.name == n || b.name.starts_with(&format!("{n} ["))).unwrap();
+    let watch = ["NPC Neck", "NPC Spine2", "NPC L Clavicle", "NPC R Clavicle", "NPC L UpperArm", "NPC R UpperArm"];
+    let level = greybox::greybox();
+    let world = level.world();
+    let cp = &level.checkpoints[0];
+    let mut c = Controller::new(Tuning::default(), cp.spawn, cp.yaw);
+    c.state = State::Ground;
+    let mut fx = CameraFx::default();
+    let mut rig = Rig::new(&arms, c.yaw);
+    let dt = 1.0 / 60.0;
+    let mut last: Option<Vec<Vec3>> = None;
+    let (mut seg_min, mut seg_jump, mut seg_jump_p) = (f32::MAX, 0.0f32, "");
+    for step in 0..600 {
+        let (mv, look_x, look_y, jump, label) = match step {
+            0..=119 => (Vec2::ZERO, 0.0, 0.0, false, "stand"),
+            120..=179 => (Vec2::ZERO, 0.0, -0.02, false, "look down"),
+            180..=239 => (Vec2::ZERO, 0.03, 0.02, false, "look round"),
+            240..=419 => (Vec2::new(0.0, 1.0), 0.0, 0.0, false, "run/sprint"),
+            420 => (Vec2::new(0.0, 1.0), 0.0, 0.0, true, "jump"),
+            _ => (Vec2::new(0.0, 1.0), 0.0, 0.0, false, "jump/land"),
+        };
+        let input = Input { move_axis: mv, look: Vec2::new(look_x, look_y), jump_pressed: jump, jump_held: jump, ..Default::default() };
+        c.step(dt, &input, &world);
+        let shot = fx.update(dt, &c, &input);
+        let fr = rig.update(dt, &c, &shot, &arms);
+        let place = Placement { origin: fr.origin, body_rot: fr.body_rot, legs_rot: fr.legs_rot };
+        let root = Xform { rot: Quat::IDENTITY, pos: f.point(place.origin), scale: 1.0 };
+        let mut local = vec![];
+        r.pose_seen(&rig.driver.globals, &place, root, true, Some((fr.cam_pos, fr.cam_rot, 0.7)), &mut local);
+        let w = worlds(&r, &local, root);
+        let cam = f.point(fr.cam_pos);
+        let rot = f.axes * fr.cam_rot;
+        // In the camera's own space (so the camera's own motion doesn't count as shaking).
+        let now: Vec<Vec3> = watch.iter().map(|n| rot.inverse() * (w[idx(n)].pos - cam)).collect();
+        for (i, p) in now.iter().enumerate() {
+            if p.length() < seg_min {
+                seg_min = p.length();
+            }
+            if let Some(l) = &last {
+                let j = (*p - l[i]).length();
+                if j > seg_jump {
+                    seg_jump = j;
+                    seg_jump_p = watch[i];
+                }
+            }
+        }
+        last = Some(now);
+        if step % 60 == 59 {
+            eprintln!("{label:11} closest body bone to the camera {seg_min:5.1} units | biggest frame-to-frame jump {seg_jump:5.2} units ({seg_jump_p})");
+            seg_min = f32::MAX;
+            seg_jump = 0.0;
+        }
+    }
+}
+
+/// The disarm's victim: the cop's clip on a Skyrim-named skeleton built on the cop, each limb
+/// pointing the way the cop's does, standing where it's put and facing the way it's turned.
+#[test]
+fn the_victim_clip_onto_a_skyrim_skeleton() {
+    let Some(dir) = std::env::var_os("ME_INSTALL") else { return };
+    use me_assets::*;
+    let cop = FaithArms::load_character(std::path::Path::new(&dir), VICTIM_PACKAGE, VICTIM_MESH, VICTIM_ANIMS, VICTIM_SET).unwrap();
+    let f = HostFrame::skyrim();
+    let r = Retarget::new(skyrim_skeleton_on(&cop, f, "Spine2"), f, &cop, &retarget::skyrim_npc_links(), &retarget::skyrim_npc_anchors());
+    assert!(r.mapped() >= 40, "mapped {}", r.mapped());
+    let mut me = vec![];
+    for seq in ["SnatchFwd", "SnatchBack"] {
+        let len = cop.anims.sequences[seq].length;
+        for t in [0.0, len * 0.4, len * 0.8] {
+            assert!(retarget::clip_globals(&cop, seq, t, &mut me));
+            let place = Placement { origin: Vec3::new(2.0, 0.0, -3.0), body_rot: Quat::from_rotation_y(0.8), legs_rot: Quat::from_rotation_y(0.8) };
+            let root = Xform { rot: Quat::IDENTITY, pos: Vec3::ZERO, scale: 1.0 };
+            let mut local = vec![];
+            r.pose(&me, &place, root, &mut local);
+            let w = worlds(&r, &local, root);
+            let host = |n: &str| w[r.bones().iter().position(|b| b.name.starts_with(n)).unwrap()].pos;
+            let placed = |n: &str| f.point(place.origin + place.body_rot * to_view(me[cop.bone(n).unwrap()].w_axis.truncate()));
+            for (s, m) in [("L", "Left"), ("R", "Right")] {
+                for (ha, hb, ma, mb) in [("UpperArm", "Forearm", "Arm", "ForeArm"), ("Forearm", "Hand", "ForeArm", "Hand"), ("Thigh", "Calf", "UpLeg", "Leg")] {
+                    let got = host(&format!("NPC {s} {hb}")) - host(&format!("NPC {s} {ha}"));
+                    let want = placed(&format!("{m}{mb}")) - placed(&format!("{m}{ma}"));
+                    let err = got.angle_between(want).to_degrees();
+                    assert!(err < 2.0, "{seq} {t}: {s} {ha}->{hb} {err} degrees off");
+                }
+            }
+            let hips = host("NPC Pelvis") - placed("Hips");
+            assert!(hips.length() < 1.0, "{seq} {t}: hips off by {hips}");
+        }
+    }
+}
+
+/// Where Faith's hands and the cop's are through a takedown, the cop placed both ways round
+/// (its rest forward towards her, or away), Faith DisarmOffset (125.9 uu) from it: how close her
+/// hands come to his hands, gun and head over the clip, summed, for each placement. The
+/// placement the game uses is the one where they meet: facing her, for all four (from behind
+/// the clip turns him itself).
+#[test]
+fn takedown_hands_meet_with_the_victim_facing_her() {
+    let Some(dir) = std::env::var_os("ME_INSTALL") else { return };
+    use me_assets::*;
+    let faith = FaithArms::load(std::path::Path::new(&dir), 4).unwrap();
+    let cop = FaithArms::load_character(std::path::Path::new(&dir), VICTIM_PACKAGE, VICTIM_MESH, VICTIM_ANIMS, VICTIM_SET).unwrap();
+    for seq in ["SnatchFwd", "SnatchFwd2", "SnatchFwd3", "SnatchBack"] {
+        let len = faith.anims.sequences[seq].length.min(cop.anims.sequences[seq].length);
+        let her = Vec3::new(0.0, 0.0, 1.259);
+        for (label, cop_rot) in [("cop's rest forward towards her", Quat::from_rotation_y(std::f32::consts::PI)), ("away from her", Quat::IDENTITY)] {
+            let (mut fm, mut cm) = (vec![], vec![]);
+            let mut sum = 0.0;
+            for fh in ["LeftHand", "RightHand"] {
+                let mut best = f32::MAX;
+                let mut t = 0.0;
+                while t < len {
+                    retarget::clip_globals(&faith, seq, t, &mut fm);
+                    retarget::clip_globals(&cop, seq, t, &mut cm);
+                    let a = her + to_view(fm[faith.bone(fh).unwrap()].w_axis.truncate());
+                    for ch in ["LeftHand", "RightHand", "RightWeapon", "Head"] {
+                        let b = cop_rot * to_view(cm[cop.bone(ch).unwrap()].w_axis.truncate());
+                        best = best.min(a.distance(b));
+                    }
+                    t += 1.0 / 30.0;
+                }
+                sum += best;
+            }
+            eprintln!("{seq}, {label}: her hands' closest {sum:.2} m (both summed)");
+            if label.starts_with("cop's") {
+                assert!(sum < 0.6, "{seq}: facing her, her hands come within {sum:.2} m");
+            } else {
+                assert!(sum > 1.0, "{seq}: facing away, still {sum:.2} m");
+            }
+        }
+    }
 }

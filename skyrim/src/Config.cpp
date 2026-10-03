@@ -12,6 +12,15 @@ namespace faith
 	const Config& GetConfig() { return config; }
 	Config&       EditConfig() { return config; }
 
+	void ResetConfig()
+	{
+		const auto dir = config.mirrorsEdgeDir;
+		config = Config{};
+		config.mirrorsEdgeDir = dir;
+		SaveConfig();
+		logger::info("settings reset to the defaults");
+	}
+
 	namespace
 	{
 		std::string Hex(std::uint32_t a_key) { return std::format("{:#x}", a_key); }
@@ -32,10 +41,18 @@ namespace faith
 		ini.SetValue("General", "iViewmodelKey", Hex(config.viewmodelKey).c_str());
 		ini.SetLongValue("General", "iDrawStage", config.drawStage);
 		ini.SetBoolValue("General", "bSpeedBlur", config.speedBlur);
-		ini.SetBoolValue("General", "bSkyrimBody", config.skyrimBody);
 		ini.SetValue("General", "iSurveyKey", Hex(config.surveyKey).c_str());
 		ini.SetValue("General", "iIdleKey", Hex(config.idleKey).c_str());
 		ini.SetValue("Course", "iRespawnKey", Hex(config.respawnKey).c_str());
+		ini.SetBoolValue("Combat", "bMeleeHits", config.meleeHits);
+		ini.SetBoolValue("General", "bWorldFixtures", config.worldFixtures);
+		ini.SetBoolValue("General", "bStamina", config.stamina);
+		ini.SetBoolValue("General", "bHeldInGrip", config.heldInGrip);
+		ini.SetBoolValue("General", "bBodyScreenMatch", config.bodyScreenMatch);
+		ini.SetDoubleValue("General", "fHeldRange", config.heldRange);
+		ini.SetDoubleValue("Combat", "fMeleeDamageMult", config.meleeDamageMult);
+		ini.SetValue("Combat", "iTakedownKey", Hex(config.takedownKey).c_str());
+		ini.SetBoolValue("Combat", "bTakedownKills", config.takedownKills);
 		ini.SetValue("General", "iWalkKey", Hex(config.walkKey).c_str());
 		ini.SetDoubleValue("General", "fWalkStick", config.walkStick);
 		ini.SetDoubleValue("General", "fBodyCameraForward", config.bodyCameraForward);
@@ -75,13 +92,21 @@ namespace faith
 		config.walkStick = static_cast<float>(ini.GetDoubleValue("General", "fWalkStick", config.walkStick));
 		config.bodyCameraForward = static_cast<float>(ini.GetDoubleValue("General", "fBodyCameraForward", config.bodyCameraForward));
 		config.bodyCameraForwardDown = static_cast<float>(ini.GetDoubleValue("General", "fBodyCameraForwardDown", config.bodyCameraForwardDown));
+		config.worldFixtures = ini.GetBoolValue("General", "bWorldFixtures", config.worldFixtures);
+		config.bodyScreenMatch = ini.GetBoolValue("General", "bBodyScreenMatch", config.bodyScreenMatch);
+		config.heldInGrip = ini.GetBoolValue("General", "bHeldInGrip", config.heldInGrip);
+		config.heldRange = static_cast<float>(ini.GetDoubleValue("General", "fHeldRange", config.heldRange));
+		config.stamina = ini.GetBoolValue("General", "bStamina", config.stamina);
+		config.meleeHits = ini.GetBoolValue("Combat", "bMeleeHits", config.meleeHits);
+		config.meleeDamageMult = static_cast<float>(ini.GetDoubleValue("Combat", "fMeleeDamageMult", config.meleeDamageMult));
+		config.takedownKey = static_cast<std::uint32_t>(ini.GetLongValue("Combat", "iTakedownKey", static_cast<long>(config.takedownKey)));
+		config.takedownKills = ini.GetBoolValue("Combat", "bTakedownKills", config.takedownKills);
 		config.respawnKey = static_cast<std::uint32_t>(ini.GetLongValue("Course", "iRespawnKey", static_cast<long>(config.respawnKey)));
 		config.courseHeight = static_cast<float>(ini.GetDoubleValue("Course", "fHeight", config.courseHeight));
 		config.nearDistanceBody = static_cast<float>(ini.GetDoubleValue("General", "fNearDistanceBody", config.nearDistanceBody));
 		config.nearDistance = static_cast<float>(ini.GetDoubleValue("General", "fNearDistance", config.nearDistance));
 		config.drawStage = static_cast<int>(ini.GetLongValue("General", "iDrawStage", config.drawStage));
 		config.speedBlur = ini.GetBoolValue("General", "bSpeedBlur", config.speedBlur);
-		config.skyrimBody = ini.GetBoolValue("General", "bSkyrimBody", config.skyrimBody);
 		config.soundVolume = static_cast<float>(ini.GetDoubleValue("General", "fSoundVolume", config.soundVolume));
 		config.viewmodelKey = static_cast<std::uint32_t>(ini.GetLongValue("General", "iViewmodelKey", static_cast<long>(config.viewmodelKey)));
 		config.collisionRadius = static_cast<float>(ini.GetDoubleValue("Collision", "fRadius", config.collisionRadius));

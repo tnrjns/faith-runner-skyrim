@@ -60,16 +60,19 @@ There's **no ESP**. If an old save complains that `FaithParkour.esp` is missing 
 | WASD | Move |
 | Mouse | Look |
 | Space | Jump, vault, wall moves, springboard |
-| Shift / C / Ctrl | Crouch, slide, roll (tap before landing) |
+| Shift / C / Ctrl | Crouch, slide, roll (tap before landing). Held while crouched or sliding, you're sneaking for Skyrim's stealth. |
 | A or D + Space | Dodge |
 | Q | 180 turn (on a wall: climb, Q, Space to kick off) |
-| Left mouse / F | Attack, barge, kick doors |
+| Left mouse / F | Attack (punch, jump kick, slide kick, wallrun kick, crouch attack), barge, kick doors |
+| **V** | Takedown: Mirror's Edge's disarm on someone within about 3 m in front of you, from the front or from behind by which way they face |
 | **Caps Lock** | Walk (toggle), like Skyrim's always-run |
-| F7 | First-person view: Faith's own body → Skyrim's whole body → Skyrim's arms |
+| F7 | First-person view: Faith's own body ↔ Skyrim's whole body |
 | G | Play one of Faith's idles. She also plays them by herself after 30-40 s standing still. |
 | R | On a training course: back to the last checkpoint |
 | F10 | Survey the collision around you, for the parkour tool |
 | F1 | SKSE Menu Framework's Mod Control Panel (its own key) |
+
+**Gamepad**, as Mirror's Edge's layout: LB jump, LT crouch, Y 180 turn, X or RT attack, right stick click takedown, Back to the checkpoint on a course; the sticks move and look.
 
 Everything else stays Skyrim's: E to activate, menus, favourites, shouts and waiting. In menus, dialogue, furniture, on horseback and in kill moves, Skyrim keeps the player until it lets go.
 
@@ -85,9 +88,9 @@ Open the **Mod Control Panel** (F1 by default) and go to **Faith Runner**. Chang
 
 | Page | What's there |
 |---|---|
-| **General** | Switch Faith on or off. First-person view. Speed blur. Third-person body animation. Play an idle. Mouse sensitivity, sound volume, walking speed, start on with a save. How far the whole-body view's camera sits ahead of the eyes. |
+| **General** | Switch Faith on or off. First-person view. Speed blur, weapons in her grip, third-person body animation. Combat: attacks landing, damage, takedowns finishing them. Skyrim's stamina. Ziplines, swing poles and beams in Skyrim's world. Play an idle. Mouse sensitivity, sound volume, walking speed, start on with a save. The whole-body view's camera. **Reset all settings** (press twice). |
 | **Course** | Pick a training map and start or leave it, the run's times, and buttons to jump to any checkpoint. |
-| **Keys** | Every key: on/off, view, idle, walk, course respawn, survey. |
+| **Keys** | Every key: on/off, view, idle, takedown, walk, course respawn, survey. |
 | **Advanced** | How Faith's body is drawn (`iDrawStage`), the near clip distances, how much of Skyrim's collision she reads and how often, and where Mirror's Edge was found. |
 
 ### In the file: `SKSE\Plugins\FaithSkyrim.ini`
@@ -117,6 +120,11 @@ Each setting is commented in the file itself.
 | `fNearDistanceBody` | `10.0` | The same, in the whole-body view. |
 | `fSoundVolume` | `0.8` | Faith's sounds: footsteps, breathing, landings, wind. 0 is off. |
 | `iSurveyKey` | `0x44` (F10) | Saves the collision around you for the parkour tool. |
+| `bWorldFixtures` | `1` | Skyrim's own cables, high bars and planks over drops work as ziplines, swing poles and balance beams. |
+| `bStamina` | `0` | Sprinting, wallruns and wallclimbs drain Skyrim's stamina; with none left she can't sprint. Mirror's Edge has no stamina, so 0 is the game's own way. |
+| `bHeldInGrip` | `1` | In Faith's own body view, what Skyrim's hands hold (weapons, shields, spells) shows in her grip. |
+| `fHeldRange` | `60` | ...anything Skyrim drew within this many units of the camera goes in front of her arms. |
+| `bBodyScreenMatch` | `1` | Whole-body view: its arms reach Faith's hands where hers appear on screen (she's drawn with Mirror's Edge's 100-degree view). 0: exactly where hers are. |
 
 **`[Collision]`**
 
@@ -124,7 +132,7 @@ Each setting is commented in the file itself.
 |---|---|---|
 | `fRadius` | `2400` | How much of Skyrim's collision around you Faith moves on, in game units (70 a metre). |
 | `fHeight` | `1400` | How far above her it reaches. Below, it reaches 60 m, more while falling fast. |
-| `fRefreshSeconds` | `0.5` | How often it's read again. It's also re-read whenever you've moved a quarter of the radius, entered a new cell, or are falling fast. |
+| `fRefreshSeconds` | `2.0` | How often it's read again (on a background thread). It's also re-read whenever you've moved a quarter of the radius, entered a new cell, or are falling fast. |
 
 **`[Course]`**
 
@@ -132,6 +140,15 @@ Each setting is commented in the file itself.
 |---|---|---|
 | `iRespawnKey` | `0x13` (R) | On a course: back to the last checkpoint. Only taken from Skyrim while you're on one. |
 | `fHeight` | `20000` | How far above you a course is built (units). Raise it if a mountain pokes through. |
+
+**`[Combat]`**
+
+| Setting | Default | What it does |
+|---|---|---|
+| `bMeleeHits` | `1` | Faith's attacks land on Skyrim's actors, decided as Mirror's Edge decides them (its target choice, hit tests and damage), with Skyrim's stagger and a push along the blow. They fight back. |
+| `fMeleeDamageMult` | `1.0` | x Mirror's Edge's damage, taken as Skyrim health: punch 33.5, air kick 60-100, slide kick 60, wallrun kick 80. |
+| `iTakedownKey` | `0x2F` (V) | Mirror's Edge's disarm on whoever's close in front of her. She takes their weapon (into your inventory); humanoids play the game's own victim animation (the patrol cop's, retargeted onto them). |
+| `bTakedownKills` | `true` | At the end they go down (essential characters only to their knees). 0: they're staggered and fight on. |
 
 ### Troubleshooting
 
@@ -245,7 +262,8 @@ cargo test --release -p faith_ffi -p faith_anim -p faith_move
 
 - **Moving objects:** they collide as they were when last read.
 - **Fixtures in the world:** ziplines, swing poles and balance beams need markers, and Skyrim has none. They exist on the training courses.
-- **Combat:** Faith's attacks and barges animate but don't hit anything.
+- **Takedowns:** creatures (non-humanoid skeletons) are held and go down but don't play the victim animation; the cop's voice lines don't load.
+- **People on a course** stand on it, but bodies fall through it (only Faith collides with it).
 
 ## Credits and licences
 

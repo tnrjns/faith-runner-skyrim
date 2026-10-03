@@ -184,9 +184,11 @@ fn melee_picks_the_attack_from_the_move() {
     let kinds = |s: &Sim| -> Vec<MeleeKind> {
         s.events.iter().filter_map(|e| if let Event::Melee { kind, .. } = e { Some(*kind) } else { None }).collect()
     };
-    // Standing punch.
-    s.run(0.3, |_, t| Input { melee_pressed: t < 0.02, ..Default::default() });
-    // Running kick, after building up speed.
+    // Standing punch (pressed for one frame: a second press inside TdMove_Melee's 0.33 s window
+    // would queue another punch).
+    let mut p = false;
+    s.run(0.3, |_, _| Input { melee_pressed: once(&mut p, true), ..Default::default() });
+    // A punch running too, after building up speed.
     let mut k = false;
     s.run(2.0, |c, _| {
         let mut i = toward_x(c, 0.0);
@@ -195,12 +197,16 @@ fn melee_picks_the_attack_from_the_move() {
     });
     // Jump kick.
     let (mut jj, mut kk) = (false, false);
+    // (Not in the jump's first 0.1 s: TdMove_MeleeAir.CanDoMove.)
+    let mut air = 0;
     s.run(1.5, |c, _| {
         let mut i = Input::default();
         i.jump_pressed = once(&mut jj, c.state == State::Ground);
-        i.melee_pressed = once(&mut kk, c.state == State::Air && c.vel.y < 2.0);
+        air = if c.state == State::Air { air + 1 } else { 0 };
+        i.melee_pressed = once(&mut kk, air > 8);
         i
     });
-    assert_eq!(kinds(&s), vec![MeleeKind::Punch, MeleeKind::RunKick, MeleeKind::AirKick]);
+    // Running, it's a punch too: Faith has no running kick (TdMove_Melee for any ground speed).
+    assert_eq!(kinds(&s), vec![MeleeKind::Punch, MeleeKind::Punch, MeleeKind::AirKick]);
     assert!(s.c.melee.is_none(), "attack never ended");
 }

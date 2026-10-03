@@ -37,11 +37,36 @@ namespace faith::Input
 		// Pressed since the last Take.
 		bool jumpPressed = false, crouchPressed = false, turnPressed = false, meleePressed = false;
 		bool togglePressed = false, viewmodelPressed = false, idlePressed = false, surveyPressed = false, respawnPressed = false;
+		bool takedownPressed = false;
 		// Skyrim's always-run toggle, for Faith: walking (the keys as half a stick, as on a pad).
 		bool walking = false, walkChanged = false;
 		std::atomic<bool> onCourse{ false };
 		float lookDx = 0.0f, lookDy = 0.0f;
 		std::atomic<bool> capturing{ false };
+
+		// A gamepad, as Mirror's Edge's shoulder layout: LB jump, LT crouch, Y 180 turn, X or RT
+		// attack, right stick click a takedown, the sticks to move and look. A, B, RB, Start and the d-pad stay Skyrim's
+		// (activate, the menus, shouts, favourites). Back, on a course: to the checkpoint.
+		using Pad = RE::BSWin32GamepadDevice::Key;
+		float stickL[2]{}, stickR[2]{};
+		bool  padJump = false, padCrouch = false;
+
+		bool IsFaithPadButton(std::uint32_t a_code, bool a_onCourse)
+		{
+			switch (a_code) {
+			case Pad::kLeftShoulder:
+			case Pad::kLeftTrigger:
+			case Pad::kY:
+			case Pad::kX:
+			case Pad::kRightTrigger:
+			case Pad::kRightThumb:
+				return true;
+			case Pad::kBack:
+				return a_onCourse;
+			default:
+				return false;
+			}
+		}
 
 		bool MenuOpen()
 		{
@@ -77,6 +102,16 @@ namespace faith::Input
 				}
 				for (auto* e = *a_event; e; e = e->next) {
 					switch (e->GetEventType()) {
+					case RE::INPUT_EVENT_TYPE::kThumbstick:
+						if (!menu) {
+							auto* t = static_cast<RE::ThumbstickEvent*>(e);
+							float* s = t->IsLeft() ? stickL : t->IsRight() ? stickR : nullptr;
+							if (s) {
+								s[0] = t->xValue;
+								s[1] = t->yValue;
+							}
+						}
+						break;
 					case RE::INPUT_EVENT_TYPE::kMouseMove:
 						if (!menu) {
 							auto* mm = e->AsMouseMoveEvent();
@@ -104,6 +139,9 @@ namespace faith::Input
 								if (isDown && code == GetConfig().idleKey && !menu) {
 									idlePressed = true;
 								}
+								if (isDown && code == GetConfig().takedownKey && !menu) {
+									takedownPressed = true;
+								}
 								if (isDown && code == GetConfig().surveyKey && !menu) {
 									surveyPressed = true;
 								}
@@ -123,6 +161,32 @@ namespace faith::Input
 									crouchPressed |= code == kLShift || code == kC || code == kLCtrl;
 									turnPressed |= code == kQ;
 									meleePressed |= code == kF;
+								}
+							} else if (button->GetDevice() == RE::INPUT_DEVICE::kGamepad && !menu && IsFaithPadButton(code, onCourse)) {
+								switch (code) {
+								case Pad::kLeftShoulder:
+									padJump = isDown;
+									jumpPressed |= isDown;
+									break;
+								case Pad::kLeftTrigger:
+									padCrouch = isDown;
+									crouchPressed |= isDown;
+									break;
+								case Pad::kY:
+									turnPressed |= isDown;
+									break;
+								case Pad::kX:
+								case Pad::kRightTrigger:
+									meleePressed |= isDown;
+									break;
+								case Pad::kBack:
+									respawnPressed |= isDown;
+									break;
+								case Pad::kRightThumb:
+									takedownPressed |= isDown;
+									break;
+								default:
+									break;
 								}
 							} else if (button->GetDevice() == RE::INPUT_DEVICE::kMouse && code == kMouseLeft && !menu) {
 								mouseLeft = isDown;
@@ -150,11 +214,15 @@ namespace faith::Input
 					const auto code = button->GetIDCode();
 					if (button->GetDevice() == RE::INPUT_DEVICE::kKeyboard) {
 						return IsFaithKey(code) || code == GetConfig().toggleKey || code == GetConfig().viewmodelKey || code == GetConfig().idleKey ||
+						       code == GetConfig().takedownKey ||
 						       code == GetConfig().walkKey ||
 						       (onCourse && code == GetConfig().respawnKey);
 					}
 					if (button->GetDevice() == RE::INPUT_DEVICE::kMouse) {
 						return code == kMouseLeft;
+					}
+					if (button->GetDevice() == RE::INPUT_DEVICE::kGamepad) {
+						return IsFaithPadButton(code, onCourse);
 					}
 					return false;
 				}
@@ -219,7 +287,7 @@ namespace faith::Input
 		}
 	}
 
-	FaithInput Take(float a_sensitivity)
+	FaithInput Take(float a_sensitivity, float a_delta)
 	{
 		FaithInput in{};
 		in.move_x = (down[kD] ? 1.0f : 0.0f) - (down[kA] ? 1.0f : 0.0f);
@@ -230,17 +298,31 @@ namespace faith::Input
 			in.move_x *= GetConfig().walkStick;
 			in.move_y *= GetConfig().walkStick;
 		}
+		// The left stick, as the app reads it (past 0.15); how far it's pushed is how fast she
+		// goes, as in Mirror's Edge.
+		if (std::hypot(stickL[0], stickL[1]) > 0.15f) {
+			in.move_x = std::clamp(in.move_x + stickL[0], -1.0f, 1.0f);
+			in.move_y = std::clamp(in.move_y + stickL[1], -1.0f, 1.0f);
+		}
 		// The app's mouse: 0.0022 radians a count (times the sensitivity setting).
 		const float k = 0.0022f * a_sensitivity;
 		in.look_right = lookDx * k;
 		in.look_up = -lookDy * k;
+		// The right stick, as the app: past 0.12, squared out, 3.2 radians a second at full.
+		const float r = std::hypot(stickR[0], stickR[1]);
+		if (r > 0.12f) {
+			const float pad = 3.2f * a_sensitivity * a_delta * r;
+			in.look_right += stickR[0] * pad;
+			in.look_up += stickR[1] * pad;
+		}
 		in.jump_pressed = jumpPressed;
-		in.jump_held = down[kSpace];
+		in.jump_held = down[kSpace] || padJump;
 		in.crouch_pressed = crouchPressed;
-		in.crouch_held = down[kLShift] || down[kC] || down[kLCtrl];
+		in.crouch_held = down[kLShift] || down[kC] || down[kLCtrl] || padCrouch;
 		in.turn_pressed = turnPressed;
 		in.melee_pressed = meleePressed;
-		jumpPressed = crouchPressed = turnPressed = meleePressed = false;
+		in.takedown_pressed = takedownPressed;
+		jumpPressed = crouchPressed = turnPressed = meleePressed = takedownPressed = false;
 		lookDx = lookDy = 0.0f;
 		return in;
 	}
@@ -295,7 +377,9 @@ namespace faith::Input
 	{
 		down.fill(false);
 		mouseLeft = false;
-		jumpPressed = crouchPressed = turnPressed = meleePressed = false;
+		jumpPressed = crouchPressed = turnPressed = meleePressed = takedownPressed = false;
 		lookDx = lookDy = 0.0f;
+		stickL[0] = stickL[1] = stickR[0] = stickR[1] = 0.0f;
+		padJump = padCrouch = false;
 	}
 }

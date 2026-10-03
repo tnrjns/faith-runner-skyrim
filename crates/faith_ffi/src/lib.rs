@@ -54,7 +54,9 @@ pub struct FaithInput {
     pub turn_pressed: u8,
     /// Attack / barge.
     pub melee_pressed: u8,
-    pub _pad: [u8; 2],
+    /// A takedown on whoever's in front of her.
+    pub takedown_pressed: u8,
+    pub _pad: u8,
 }
 
 /// What happened this frame (bits of `FaithFrame::events`).
@@ -78,6 +80,8 @@ pub mod events {
     pub const SPRINGBOARD: u64 = 1 << 16;
     pub const MELEE: u64 = 1 << 17;
     pub const BARGE: u64 = 1 << 18;
+    /// An attack landed (faith_melee_hits).
+    pub const MELEE_HIT: u64 = 1 << 19;
     pub const OTHER: u64 = 1 << 31;
 }
 
@@ -107,7 +111,8 @@ pub struct FaithFrame {
     pub animated: u8,
     /// The arms draw in the world's depth this frame (swinging) rather than over it.
     pub intermediate: u8,
-    pub _pad: u8,
+    /// Low to the ground: crouched or sliding (the host's sneaking).
+    pub low: u8,
     /// Mirror's Edge's speed blur this frame (TdMotionBlurShader.usf's MotionPacked.r): 0 still,
     /// about 0.5 at full speed straight ahead.
     pub speed_blur: f32,
@@ -141,17 +146,31 @@ pub struct Faith {
     origin: [f64; 3],
     /// The collision as the host gave it (host frame), for re-centring.
     host_tris: Vec<f32>,
+    /// Thin capsules and boxes in it that may be ziplines, swing poles or beams (host frame).
+    host_candidates: Vec<world_fixtures::FaithFixtureCandidate>,
     ctrl: Controller,
     fx: CameraFx,
     look: LookLimiter,
     shot: Shot,
     speed_blur: SpeedBlur,
     world: MeshWorld,
+    /// What moves in the host's world (doors, gates), given again every frame (faith_set_moving).
+    moving: MeshWorld,
     /// One of the app's maps, played instead of the host's world.
     course: Option<course::Course>,
+    /// What her feet and hands touch, as the host says (faith_set_surfaces).
+    surfaces: (faith_move::greybox::Surface, faith_move::greybox::Surface),
+    /// faith_set_screen_scale: how much narrower than her arms' the view a body is drawn with is.
+    screen_scale: f32,
+    /// The attacks that landed in the last step (faith_melee_hits).
+    hits: Vec<melee::FaithHit>,
+    /// The takedowns started or finished in the last step (faith_takedowns).
+    takedowns: Vec<melee::FaithTakedown>,
     anim: Option<(FaithArms, Rig)>,
     last: Option<RigFrame>,
     skeletons: Vec<Retarget>,
+    /// The disarm's victim side (faith_bind_victim / faith_pose_victim).
+    victims: victim::Victims,
     /// Faith's own first-person body, for the host to draw.
     parts: Vec<body::Part>,
     /// Faith's sounds (with Mirror's Edge's sound packages and a sound device).
@@ -232,6 +251,7 @@ impl Faith {
             frame,
             origin: [0.0; 3],
             host_tris: vec![],
+            host_candidates: vec![],
             ctrl,
             fx,
             look: LookLimiter::default(),
@@ -239,9 +259,15 @@ impl Faith {
             speed_blur: SpeedBlur::default(),
             world: MeshWorld::new(vec![], vec![]),
             course: None,
+            moving: MeshWorld::new(vec![], vec![]),
+            hits: vec![],
+            takedowns: vec![],
+            screen_scale: 1.0,
+            surfaces: (faith_move::greybox::Surface::Concrete, faith_move::greybox::Surface::Concrete),
             anim,
             last: None,
             skeletons: vec![],
+            victims: Default::default(),
             parts,
             audio,
             names: vec![],
@@ -254,6 +280,10 @@ impl Faith {
     fn local(&self, p: Vec3) -> Vec3 {
         let o = self.origin;
         self.frame.point_back(Vec3::new((p.x as f64 - o[0]) as f32, (p.y as f64 - o[1]) as f32, (p.z as f64 - o[2]) as f32))
+    }
+
+    pub(crate) fn local_point(&self, p: Vec3) -> Vec3 {
+        self.local(p)
     }
 
     pub(crate) fn host(&self, p: Vec3) -> Vec3 {
@@ -270,6 +300,19 @@ impl Faith {
             .filter(|t| t.iter().all(|p| p.is_finite()) && (t[1] - t[0]).cross(t[2] - t[0]).length_squared() > 1e-12)
             .collect();
         self.world = MeshWorld::new(tris, vec![]);
+        // Which of the thin pieces work as ziplines, swing poles and balance beams.
+        let k = 1.0 / self.frame.units_per_meter;
+        let cands: Vec<faith_move::fixtures::Candidate> = self
+            .host_candidates
+            .iter()
+            .map(|c| faith_move::fixtures::Candidate {
+                a: self.local(c.a.into()),
+                b: self.local(c.b.into()),
+                thickness: c.thickness * k,
+                capsule: c.capsule != 0,
+            })
+            .collect();
+        self.world.fixtures = faith_move::fixtures::classify(&self.world, &cands);
     }
 
     /// Re-centre faith_move's origin on the player once they've gone far from it (standing on
@@ -310,9 +353,48 @@ impl Faith {
             crouch_held: i.crouch_held != 0,
             turn_pressed: i.turn_pressed != 0,
             melee_pressed: i.melee_pressed != 0,
+            takedown_pressed: i.takedown_pressed != 0,
             strafe_raw: i.move_x.clamp(-1.0, 1.0),
         };
-        self.ctrl.step(dt, &input, &self.world);
+        // The attacking limb, where the animation last put it (TdMove_MeleeBase's sweep).
+        self.ctrl.hit_bone = match (self.ctrl.melee_bone(), &self.anim, self.last) {
+            (Some(bone), Some((arms, rig)), Some(r)) => {
+                let place = Placement { origin: r.origin, body_rot: r.body_rot, legs_rot: r.legs_rot };
+                retarget::bone_position(arms, &rig.driver.globals, &place, bone)
+            }
+            _ => None,
+        };
+        if self.course.is_none() && !self.moving.tris.is_empty() {
+            let both = faith_move::world::Layered { still: &self.world, moving: &self.moving };
+            self.ctrl.step(dt, &input, &both);
+        } else {
+            self.ctrl.step(dt, &input, &self.world);
+        }
+        self.hits.clear();
+        self.takedowns.clear();
+        for e in &self.ctrl.events {
+            match *e {
+                faith_move::Event::Takedown { target, anim, enemy_at, enemy_dir } => self.takedowns.push(melee::FaithTakedown {
+                    target,
+                    anim: anim as u32,
+                    done: 0,
+                    enemy_at: self.host(enemy_at).into(),
+                    enemy_dir: (self.frame.axes * enemy_dir).into(),
+                }),
+                faith_move::Event::TakedownDone { target } => {
+                    self.takedowns.push(melee::FaithTakedown { target, done: 1, ..Default::default() })
+                }
+                _ => {}
+            }
+            if let faith_move::Event::MeleeHit { target, damage, momentum, kind } = *e {
+                self.hits.push(melee::FaithHit {
+                    target,
+                    damage,
+                    momentum: (self.frame.axes * momentum * self.frame.units_per_meter).into(),
+                    kind: kind as u32,
+                });
+            }
+        }
         if let Some(c) = &mut self.course {
             c.update(dt, &mut self.ctrl);
         }
@@ -363,6 +445,7 @@ impl Faith {
                 Event::Death => events::DEATH,
                 Event::SpringBoard => events::SPRINGBOARD,
                 Event::Melee { .. } => events::MELEE,
+                Event::MeleeHit { .. } => events::MELEE_HIT,
                 Event::Barge { .. } => events::BARGE,
                 _ => events::OTHER,
             };
@@ -375,7 +458,16 @@ impl Faith {
             let notifies = self.anim.as_ref().map(|(_, rig)| rig.driver.notifies().to_vec()).unwrap_or_default();
             let mut out = vec![];
             // Skyrim's ground doesn't say what it's made of the way Mirror's Edge's does: concrete.
-            audio.director.update(dt, c, &notifies, self.anim.is_some(), self.shot.step_phase, &|_| faith_move::greybox::Surface::Concrete, &mut out);
+            // What she steps on: on a course its boxes (as the app), else what the host says.
+            let (foot, hand) = self.surfaces;
+            let course_level = self.course.as_ref().map(|k| &k.level);
+            let feet = c.feet;
+            let surface = |is_hand: bool| match course_level {
+                Some(l) => l.surface_near(feet, if is_hand { 0.9 } else { 0.3 }).unwrap_or(faith_move::greybox::Surface::Concrete),
+                None if is_hand => hand,
+                None => foot,
+            };
+            audio.director.update(dt, c, &notifies, self.anim.is_some(), self.shot.step_phase, &surface, &mut out);
             for cmd in out {
                 audio.run(cmd);
             }
@@ -396,7 +488,7 @@ impl Faith {
             on_ground: matches!(c.state, faith_move::State::Ground) as u8,
             animated: self.anim.is_some() as u8,
             intermediate: self.last.is_some_and(|r| r.intermediate) as u8,
-            _pad: 0,
+            low: (c.crouched || matches!(c.state, faith_move::State::Slide { .. })) as u8,
             speed_blur,
         }
     }
@@ -405,6 +497,11 @@ impl Faith {
 mod audio;
 pub mod body;
 pub mod course;
+pub mod melee;
+pub mod moving;
+pub mod surfaces;
+pub mod victim;
+pub mod world_fixtures;
 
 pub(crate) unsafe fn handle<'a>(h: *mut Faith) -> Option<&'a mut Faith> {
     unsafe { h.as_mut() }
@@ -554,25 +651,9 @@ pub unsafe extern "C" fn faith_bind_skeleton(
             set_error("no Mirror's Edge animation loaded");
             return -1;
         };
-        if names.is_null() || parents.is_null() || rest.is_null() {
-            return -1;
-        }
-        let n = count as usize;
-        let (names, parents, rest) =
-            unsafe { (std::slice::from_raw_parts(names, n), std::slice::from_raw_parts(parents, n), std::slice::from_raw_parts(rest, n)) };
-        let mut bones = Vec::with_capacity(n);
-        for i in 0..n {
-            let name = if names[i].is_null() { String::new() } else { unsafe { CStr::from_ptr(names[i]) }.to_string_lossy().into_owned() };
-            let parent = usize::try_from(parents[i]).ok();
-            if parent.is_some_and(|p| p >= i) {
-                set_error(format!("bone {i} ({name}) comes before its parent"));
-                return -1;
-            }
-            let x: Xform = rest[i].into();
-            bones.push(BoneRest { name, parent, rot: x.rot, pos: x.pos, scale: x.scale });
-        }
+        let Some(bones) = (unsafe { bones_from(count, names, parents, rest) }) else { return -1 };
         let anchors = if kind == 1 { retarget::skyrim_arms_anchors() } else { retarget::skyrim_body_anchors() };
-        let r = Retarget::new(bones, f.frame, arms, &retarget::skyrim_links(), &anchors);
+        let r = Retarget::new(bones, f.frame, arms, &retarget::skyrim_links(), &anchors).with_arm_ik(arms, &retarget::skyrim_arm_ik());
         if r.mapped() == 0 {
             set_error("no bones matched");
             return -1;
@@ -580,6 +661,35 @@ pub unsafe extern "C" fn faith_bind_skeleton(
         f.skeletons.push(r);
         (f.skeletons.len() - 1) as i32
     })
+}
+
+/// A host skeleton as faith_bind_skeleton takes it, or None (error set).
+pub(crate) unsafe fn bones_from(count: u32, names: *const *const c_char, parents: *const i32, rest: *const FaithXform) -> Option<Vec<BoneRest>> {
+    if names.is_null() || parents.is_null() || rest.is_null() {
+        set_error("null skeleton");
+        return None;
+    }
+    let n = count as usize;
+    let (names, parents, rest) = unsafe { (std::slice::from_raw_parts(names, n), std::slice::from_raw_parts(parents, n), std::slice::from_raw_parts(rest, n)) };
+    let mut bones = Vec::with_capacity(n);
+    for i in 0..n {
+        let name = if names[i].is_null() { String::new() } else { unsafe { CStr::from_ptr(names[i]) }.to_string_lossy().into_owned() };
+        let parent = usize::try_from(parents[i]).ok();
+        if parent.is_some_and(|p| p >= i) {
+            set_error(format!("bone {i} ({name}) comes before its parent"));
+            return None;
+        }
+        let x: Xform = rest[i].into();
+        bones.push(BoneRest { name, parent, rot: x.rot, pos: x.pos, scale: x.scale });
+    }
+    Some(bones)
+}
+
+/// A host world transform in faith_move's re-centred host frame.
+pub(crate) fn recentred(f: &Faith, x: FaithXform) -> Xform {
+    let mut x: Xform = x.into();
+    x.pos = Vec3::new((x.pos.x as f64 - f.origin[0]) as f32, (x.pos.y as f64 - f.origin[1]) as f32, (x.pos.z as f64 - f.origin[2]) as f32);
+    x
 }
 
 /// How many of a bound skeleton's bones are driven.
@@ -598,6 +708,18 @@ pub unsafe extern "C" fn faith_pose_skeleton(h: *mut Faith, skeleton: i32, root_
 
 /// Pin the first-person skeleton's hands onto Faith's (`faith_pose_skeleton_ex` flags).
 pub const POSE_PIN_HANDS: u32 = 1;
+/// With POSE_PIN_HANDS: the hands placed as far across the screen as Faith's appear, for a body
+/// drawn with a narrower view than her arms (faith_set_screen_scale).
+pub const POSE_SCREEN_MATCH: u32 = 2;
+
+/// How much narrower the view a body is drawn with (POSE_SCREEN_MATCH) is than her arms':
+/// tan(its horizontal half angle) / tan(her arms'). 1: the same.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faith_set_screen_scale(h: *mut Faith, k: f32) {
+    if let Some(f) = unsafe { handle(h) } {
+        f.screen_scale = if k.is_finite() && k > 0.05 { k.min(4.0) } else { 1.0 };
+    }
+}
 
 /// [`faith_pose_skeleton`] with flags: POSE_PIN_HANDS puts the hands exactly where Faith's are
 /// (for what they hold, when her own body is drawn and the host's arms are hidden).
@@ -618,7 +740,8 @@ pub unsafe extern "C" fn faith_pose_skeleton_ex(h: *mut Faith, skeleton: i32, ro
             (parent.pos.y as f64 - f.origin[1]) as f32,
             (parent.pos.z as f64 - f.origin[2]) as f32,
         );
-        r.pose_with(&rig.driver.globals, &place, parent, flags & POSE_PIN_HANDS != 0, &mut local);
+        let seen = (flags & POSE_SCREEN_MATCH != 0 && f.screen_scale > 0.0).then(|| (frame.cam_pos, frame.cam_rot, f.screen_scale));
+        r.pose_seen(&rig.driver.globals, &place, parent, flags & POSE_PIN_HANDS != 0, seen, &mut local);
         let out = unsafe { std::slice::from_raw_parts_mut(out, local.len()) };
         for (o, l) in out.iter_mut().zip(&local) {
             *o = (*l).into();

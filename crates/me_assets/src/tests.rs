@@ -58,7 +58,8 @@ fn legs_load_with_their_textures() {
 #[test]
 fn animations_decode_to_valid_rotations() {
     let Some(a) = arms() else { return };
-    assert_eq!(a.anims.sequences.len(), 281);
+    // The unarmed set and the disarm clips it lacks from the one-handed set.
+    assert_eq!(a.anims.sequences.len(), 285);
     assert_eq!(a.anims.bones, a.mesh.bones.iter().map(|b| b.name.clone()).collect::<Vec<_>>());
     for s in a.anims.sequences.values() {
         for t in &s.tracks {
@@ -291,4 +292,46 @@ fn arm_morphs_fit_the_mesh() {
         eprintln!("{} {} verts, max delta {max:.2}, bones {bones:?}", m.name, m.deltas.len());
         assert!(m.deltas.iter().all(|(v, _)| (*v as usize) < arms.mesh.vertices.len()), "{}", m.name);
     }
+}
+
+/// TdMove_Disarm's clips come from the one-handed set, on Faith's bones.
+#[test]
+fn disarm_clips_load() {
+    let Some(a) = arms() else { return };
+    for n in ["SnatchFwd", "SnatchFwd2", "SnatchFwd3", "SnatchBack", "SnatchFail"] {
+        let s = a.anims.sequences.get(n).unwrap_or_else(|| panic!("{n}"));
+        eprintln!("{n} {:.2} s", s.length);
+        assert_eq!(s.tracks.len(), a.anims.bones.len());
+        let g = pose_of(&a, n, s.length * 0.5);
+        assert!(g.iter().all(|m| m.is_finite()), "{n}");
+        // The hands reach out and back: the tracks landed on Faith's bones.
+        let moved = pos(&a, &pose_of(&a, n, 0.0), "RightHand").distance(pos(&a, &g, "RightHand"));
+        assert!(moved > 5.0, "{n}: right hand moved {moved}");
+    }
+}
+
+/// The disarm's victim side: the patrol cop, its four clips (as Faith's, by name), facing the
+/// way Faith's own mesh does (toes ahead along -Z, the view's forward).
+#[test]
+fn the_cop_and_its_disarm_clips() {
+    let Some(dir) = std::env::var_os("ME_INSTALL") else { return };
+    let cop = FaithArms::load_character(Path::new(&dir), VICTIM_PACKAGE, VICTIM_MESH, VICTIM_ANIMS, VICTIM_SET).unwrap();
+    for n in ["SnatchFwd", "SnatchFwd2", "SnatchFwd3", "SnatchBack"] {
+        let s = cop.anims.sequences.get(n).unwrap_or_else(|| panic!("{n}"));
+        assert!(s.length > 1.5, "{n} {}", s.length);
+        for t in &s.tracks {
+            for q in &t.rotations {
+                assert!(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] <= 1.001, "{n}");
+            }
+        }
+    }
+    let rest = Pose::rest(&cop.mesh);
+    let mut g = vec![];
+    pose::globals(&cop.mesh, &rest, &mut g);
+    let at = |n: &str| pose::to_view(g[cop.bone(n).unwrap()].w_axis.truncate());
+    let toes = (at("LeftToeBase") - at("LeftFoot")) + (at("RightToeBase") - at("RightFoot"));
+    let head = at("Head") - at("LeftFoot");
+    eprintln!("cop toes {toes} head {head}");
+    assert!(toes.z < 0.0 && toes.z.abs() > toes.x.abs(), "toes {toes}");
+    assert!(head.y > 1.4, "head {head}");
 }

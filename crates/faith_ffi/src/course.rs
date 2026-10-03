@@ -8,7 +8,7 @@ use std::ffi::{c_char, CString};
 use glam::{Quat, Vec2, Vec3};
 
 use faith_move::greybox::{Level, Look};
-use faith_move::{Aabb, Fixture, MeshWorld};
+use faith_move::{Aabb, Fixture, MeshWorld, World};
 
 use crate::{guard, handle, Faith, FaithVec3};
 
@@ -189,6 +189,7 @@ fn look_index(l: Look) -> u32 {
 }
 const METAL: u32 = 6;
 
+
 /// A box's faces in faith_move's frame, with the app's uvs (one grid square a metre), turned by
 /// `rot` about `pivot`.
 fn push_box(out: &mut Vec<(Vec3, Vec3, Vec2, u32)>, b: &Aabb, look: u32, rot: Quat, pivot: Vec3) {
@@ -354,5 +355,27 @@ pub unsafe extern "C" fn faith_course_mesh(h: *mut Faith, out: *mut FaithCourseV
             }
         }
         tris.len() as u32
+    })
+}
+
+/// The ground under a host point: the first solid below it (looking from 0.5 m above, up to
+/// `drop` host units down) in the world Faith moves in now (a course's own while on one), so
+/// the host can stand its people on what only Faith collides with. 0 if there's nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faith_ground_below(h: *mut Faith, at: FaithVec3, drop: f32, out: *mut FaithVec3) -> u8 {
+    let Some(f) = (unsafe { handle(h) }) else { return 0 };
+    if out.is_null() {
+        return 0;
+    }
+    guard(0, || {
+        let from = f.local_point(at.into()) + Vec3::Y * 0.5;
+        let down = drop.max(0.0) / f.frame.units_per_meter + 0.5;
+        match f.world.sweep(Vec3::new(0.05, 0.01, 0.05), from, Vec3::new(0.0, -down, 0.0)) {
+            Some(hit) => {
+                unsafe { *out = f.host(Vec3::new(from.x, hit.point.y, from.z)).into() };
+                1
+            }
+            None => 0,
+        }
     })
 }

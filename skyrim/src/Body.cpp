@@ -101,7 +101,7 @@ namespace faith::Body
 
 		// The skeleton NIFs to read the rest pose from: the race's own for the body; for the
 		// arms the same file name under _1stPerson, then _1stPerson\skeleton.nif.
-		std::vector<std::string> RestPaths(RE::PlayerCharacter* a_player, bool a_firstPerson)
+		std::vector<std::string> RestPaths(RE::Actor* a_player, bool a_firstPerson)
 		{
 			std::vector<std::string> out;
 			auto*                    race = a_player->GetRace();
@@ -127,17 +127,13 @@ namespace faith::Body
 		}
 	}
 
-	bool Skeleton::Bind(Faith* a_faith, RE::PlayerCharacter* a_player, bool a_firstPerson)
+	bool Skeleton::Gather(RE::Actor* a_player, bool a_firstPerson, std::vector<std::string>& names, std::vector<std::int32_t>& parents,
+		std::vector<FaithXform>& rest, std::string& from)
 	{
-		tried = true;
 		auto* live = a_player->Get3D(a_firstPerson);
 		if (!live) {
 			return false;
 		}
-		std::vector<std::string>  names;
-		std::vector<std::int32_t> parents;
-		std::vector<FaithXform>   rest;
-		std::string               from;
 		for (const auto& path : RestPaths(a_player, a_firstPerson)) {
 			if (auto nif = LoadNif(path)) {
 				Collect(nif.get(), -1, names, parents, rest);
@@ -151,6 +147,19 @@ namespace faith::Body
 			// No skeleton file: the live skeleton's current pose stands in for the rest pose.
 			Collect(live, -1, names, parents, rest);
 			from = "the live skeleton";
+		}
+		return !names.empty();
+	}
+
+	bool Skeleton::Bind(Faith* a_faith, RE::Actor* a_player, bool a_firstPerson)
+	{
+		tried = true;
+		std::vector<std::string>  names;
+		std::vector<std::int32_t> parents;
+		std::vector<FaithXform>   rest;
+		std::string               from;
+		if (!Gather(a_player, a_firstPerson, names, parents, rest, from)) {
+			return false;
 		}
 		std::vector<const char*> cnames;
 		for (const auto& n : names) {
@@ -169,11 +178,45 @@ namespace faith::Body
 		return true;
 	}
 
-	void Skeleton::Apply(Faith* a_faith, RE::NiAVObject* a_live, std::uint32_t a_flags)
+	bool Skeleton::BindVictim(Faith* a_faith, RE::Actor* a_actor)
+	{
+		tried = true;
+		std::vector<std::string>  names;
+		std::vector<std::int32_t> parents;
+		std::vector<FaithXform>   rest;
+		std::string               from;
+		if (!Gather(a_actor, false, names, parents, rest, from)) {
+			return false;
+		}
+		std::vector<const char*> cnames;
+		for (const auto& n : names) {
+			cnames.push_back(n.c_str());
+		}
+		id = faith_bind_victim(a_faith, static_cast<std::uint32_t>(names.size()), cnames.data(), parents.data(), rest.data());
+		if (id < 0) {
+			logger::warn("takedown victim skeleton: couldn't bind ({}): {}", from, faith_last_error());
+			return false;
+		}
+		bones = std::move(names);
+		root = nullptr;
+		out.assign(bones.size(), {});
+		logger::info("takedown victim skeleton: {} bones from {}", bones.size(), from);
+		return true;
+	}
+
+	void Skeleton::ApplyVictim(Faith* a_faith, RE::NiAVObject* a_live, std::uint32_t a_anim, float a_time, const RE::NiPoint3& a_feet, float a_heading)
 	{
 		if (id < 0 || !a_live) {
 			return;
 		}
+		Find(a_live);
+		if (faith_pose_victim(a_faith, id, a_anim, a_time, { a_feet.x, a_feet.y, a_feet.z }, a_heading, ToXform(a_live->world), out.data())) {
+			Write(a_live);
+		}
+	}
+
+	void Skeleton::Find(RE::NiAVObject* a_live)
+	{
 		if (a_live != root) {
 			// The 3D was (re)built: find the nodes again.
 			root = a_live;
@@ -185,9 +228,21 @@ namespace faith::Body
 			}
 			logger::info("skeleton: {} of {} bones found in the live 3D", found, bones.size());
 		}
-		if (!faith_pose_skeleton_ex(a_faith, id, ToXform(a_live->world), a_flags, out.data())) {
+	}
+
+	void Skeleton::Apply(Faith* a_faith, RE::NiAVObject* a_live, std::uint32_t a_flags)
+	{
+		if (id < 0 || !a_live) {
 			return;
 		}
+		Find(a_live);
+		if (faith_pose_skeleton_ex(a_faith, id, ToXform(a_live->world), a_flags, out.data())) {
+			Write(a_live);
+		}
+	}
+
+	void Skeleton::Write(RE::NiAVObject* a_live)
+	{
 		for (std::size_t i = 0; i < nodes.size(); ++i) {
 			if (nodes[i]) {
 				FromXform(out[i], nodes[i]->local);
