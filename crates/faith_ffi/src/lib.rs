@@ -56,7 +56,8 @@ pub struct FaithInput {
     pub melee_pressed: u8,
     /// A takedown on whoever's in front of her.
     pub takedown_pressed: u8,
-    pub _pad: u8,
+    /// Reaction Time (AttemptReactionTime): starts it when the meter's full.
+    pub reaction_pressed: u8,
 }
 
 /// What happened this frame (bits of `FaithFrame::events`).
@@ -116,6 +117,10 @@ pub struct FaithFrame {
     /// Mirror's Edge's speed blur this frame (TdMotionBlurShader.usf's MotionPacked.r): 0 still,
     /// about 0.5 at full speed straight ahead.
     pub speed_blur: f32,
+    /// Reaction Time: the meter (0..100), and the game speed the host should run at (1 normally,
+    /// down to 0.25 while it's on). The host's `dt` is game time (slowed by it).
+    pub reaction_energy: f32,
+    pub game_speed: f32,
 }
 
 /// A transform as `faith.h` passes them: rotation quaternion (x, y, z, w), translation, scale.
@@ -153,6 +158,7 @@ pub struct Faith {
     look: LookLimiter,
     shot: Shot,
     speed_blur: SpeedBlur,
+    reaction: faith_move::reaction::ReactionTime,
     world: MeshWorld,
     /// What moves in the host's world (doors, gates), given again every frame (faith_set_moving).
     moving: MeshWorld,
@@ -257,6 +263,7 @@ impl Faith {
             look: LookLimiter::default(),
             shot: Shot::default(),
             speed_blur: SpeedBlur::default(),
+            reaction: Default::default(),
             world: MeshWorld::new(vec![], vec![]),
             course: None,
             moving: MeshWorld::new(vec![], vec![]),
@@ -364,6 +371,11 @@ impl Faith {
             }
             _ => None,
         };
+        // TdPlayerController.UpdateReactionTime (PlayerTick, before the pawn moves).
+        if i.reaction_pressed != 0 {
+            self.reaction.attempt();
+        }
+        self.reaction.update(dt, self.ctrl.vel.length());
         if self.course.is_none() && !self.moving.tris.is_empty() {
             let both = faith_move::world::Layered { still: &self.world, moving: &self.moving };
             self.ctrl.step(dt, &input, &both);
@@ -374,12 +386,14 @@ impl Faith {
         self.takedowns.clear();
         for e in &self.ctrl.events {
             match *e {
-                faith_move::Event::Takedown { target, anim, enemy_at, enemy_dir } => self.takedowns.push(melee::FaithTakedown {
+                faith_move::Event::Takedown { target, anim, enemy_at, enemy_dir, clip_at, clip_dir } => self.takedowns.push(melee::FaithTakedown {
                     target,
                     anim: anim as u32,
                     done: 0,
                     enemy_at: self.host(enemy_at).into(),
                     enemy_dir: (self.frame.axes * enemy_dir).into(),
+                    clip_at: self.host(clip_at).into(),
+                    clip_dir: (self.frame.axes * clip_dir).into(),
                 }),
                 faith_move::Event::TakedownDone { target } => {
                     self.takedowns.push(melee::FaithTakedown { target, done: 1, ..Default::default() })
@@ -489,6 +503,8 @@ impl Faith {
             animated: self.anim.is_some() as u8,
             intermediate: self.last.is_some_and(|r| r.intermediate) as u8,
             low: (c.crouched || matches!(c.state, faith_move::State::Slide { .. })) as u8,
+            reaction_energy: self.reaction.energy,
+            game_speed: self.reaction.game_speed,
             speed_blur,
         }
     }
@@ -752,3 +768,12 @@ pub unsafe extern "C" fn faith_pose_skeleton_ex(h: *mut Faith, skeleton: i32, ro
 
 #[cfg(test)]
 mod tests;
+
+/// Mirror's Edge's auto step-up (TdMove_AutoStepUp, which the game ships switched off): walking
+/// into something 35-48 uu high, she steps up onto it. For a host whose stairs aren't ramped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faith_set_auto_step_up(h: *mut Faith, on: u8) {
+    if let Some(f) = unsafe { handle(h) } {
+        f.ctrl.tuning.auto_step_up = on != 0;
+    }
+}

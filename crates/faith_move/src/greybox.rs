@@ -199,6 +199,9 @@ pub fn greybox() -> Level {
     // The block itself is the climb wall (face at z = -72).
     l.add(Wall, [-6.0, -7.0, z::KICK_WALL], [6.0, ROOF_C_Y, z::CLIMB_WALL]);
     l.paint(Runner, [-2.0, ROOF_C_Y - 0.25, z::CLIMB_WALL - 0.01], [2.0, ROOF_C_Y + 0.004, z::CLIMB_WALL + 0.004]);
+    // A ladder and a drainpipe up it too, either side of the climb.
+    l.fixtures.push(Fixture::Ladder(crate::climb::Ladder { base: Vec3::new(4.2, ROOF_B_Y, z::CLIMB_WALL), top: ROOF_C_Y, normal: Vec3::Z, pipe: false }));
+    l.fixtures.push(Fixture::Ladder(crate::climb::Ladder { base: Vec3::new(-4.2, ROOF_B_Y, z::CLIMB_WALL), top: ROOF_C_Y, normal: Vec3::Z, pipe: true }));
     // Tall wall to climb, turn and kick off (left half only).
     l.add(Runner, [-6.0, ROOF_C_Y, z::KICK_WALL - 4.0], [0.0, 16.0, z::KICK_WALL]);
     // Catwalk you kick back onto.
@@ -215,6 +218,10 @@ pub fn greybox() -> Level {
         l.add(Prop, [4.0, ROOF_D_Y, -130.0], [10.0, ROOF_D_Y + 0.22 * (i + 1) as f32, z0]);
     }
     l.add(Finish, [6.5, ROOF_D_Y + 1.76, -128.0], [7.5, ROOF_D_Y + 5.0, -127.0]);
+    // Two swing bars beside the stairs, one after the other: jump off the first at the second.
+    for z in [-115.0, -118.5] {
+        l.fixtures.push(Fixture::SwingPole { a: Vec3::new(10.8, ROOF_D_Y + 2.6, z), b: Vec3::new(13.6, ROOF_D_Y + 2.6, z) });
+    }
 
     // ---- Skyline: tall white blocks all around -----------------------
     let sky = [

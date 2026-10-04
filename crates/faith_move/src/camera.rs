@@ -150,6 +150,8 @@ pub struct CameraFx {
     flip: Option<f32>,
     /// Extra look-up while climbing/hanging, so the wall top and your hands are in view.
     assist: f32,
+    /// TdPlayerController's zoom (TdMove_Vertigo's StartZoom / UnZoom), degrees off the FOV.
+    zoom: f32,
 }
 
 impl Default for CameraFx {
@@ -185,6 +187,7 @@ impl CameraFx {
             yaw_rate: 0.0,
             flip: None,
             assist: 0.0,
+            zoom: 0.0,
         }
     }
 
@@ -342,6 +345,10 @@ impl CameraFx {
                 _ => 0.0,
             };
         self.fov = approach(self.fov, target_fov, 4.0, dt);
+        // TdMove_Vertigo: StartZoom(ZoomFOV 84 of the default 90, ZoomRate 30 a second); UnZoom
+        // back at 20.
+        let (zoom_to, zoom_rate) = if c.vertigo_zoom { (84.0 - 90.0, 30.0) } else { (0.0, 20.0) };
+        self.zoom += (zoom_to - self.zoom).clamp(-zoom_rate * dt, zoom_rate * dt);
 
         let eye = base.eye
             + Vec3::Y * (dip + bob_y + flip_drop)
@@ -355,7 +362,7 @@ impl CameraFx {
                 yaw: base.yaw + sh_yaw,
                 pitch: base.pitch + self.assist + pitch_kick + sh_pitch + flip_pitch,
                 roll: self.roll + bob_roll + lean + sh_roll,
-                fov_deg: self.fov,
+                fov_deg: self.fov + self.zoom,
             },
             step_phase: self.step_phase,
             gait: self.gait,

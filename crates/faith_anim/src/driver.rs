@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use glam::{Mat4, Quat, Vec3};
-use faith_move::{Controller, Event as MoveEvent, MeleeKind, State as MoveState, TraverseKind};
+use faith_move::{airbarge::AirBargePhase, ClimbStart, Controller, Event as MoveEvent, MeleeKind, State as MoveState, TraverseKind};
 use me_assets::pose::{self, Pose, TrackMap};
 use me_assets::anim::Notify;
 use me_assets::{AnimSet, FaithArms};
@@ -111,6 +111,8 @@ pub struct Driver {
     oneshot: Option<OneShot>,
     /// Blend-in for the next animation after a one-shot ends.
     pending_blend: Option<f32>,
+    /// The walk cycle the walking layer's sound cues last came from.
+    loco_notify_seq: Option<&'static str>,
     /// WallRunVertical's rate for the current wallclimb (TdMove_WallClimb.ReachedWall).
     wallclimb_rate: f32,
     clock: f32,
@@ -210,6 +212,18 @@ fn landing_run_weight(amount: f32, t: f32) -> f32 {
     amount * if t < dur { up(t) } else { up(dur) * (1.0 - (t - dur) / 0.4).max(0.0) }
 }
 
+/// TdMove_Climb.InitClimbAnimSeqNames: ClimbAnims[0..4].
+fn climb_clip(pipe: bool, anim: u8) -> &'static str {
+    match (pipe, anim) {
+        (false, 0) => "LadderClimbUpLeftHand",
+        (false, _) => "LadderClimbUpRightHand",
+        (true, 0) => "PipeClimbUpLeftHand",
+        (true, 1) => "PipeClimbUpRightHand",
+        (true, 2) => "pipeclimbupfastlefthand",
+        (true, _) => "pipeclimbupfastrighthand",
+    }
+}
+
 /// Does this animation carry the body through space (root motion baked into
 /// the hips), which gameplay already moves the player through? Vaults,
 /// climbs, pull-ups, rolls and the ledge shimmy do; crouches and the hard
@@ -304,6 +318,7 @@ impl Driver {
             speed: 0.0,
             oneshot: None,
             pending_blend: None,
+            loco_notify_seq: None,
             wallclimb_rate: 1.0,
             clock: 0.0,
             prev_state: None,
@@ -386,6 +401,23 @@ impl Driver {
         Some(out)
     }
 
+    /// A clip's root bone position from its start, every 1/60 s (the clip's own space and
+    /// units): what UseRootMotion moves the pawn by.
+    pub fn root_pos_curve(&self, arms: &FaithArms, seq: &str) -> Option<Vec<Vec3>> {
+        let sq = arms.anims.sequences.get(seq)?;
+        let len = sq.length / sq.rate.max(1e-3);
+        let n = (len * faith_move::TurnCurves::RATE).ceil() as usize;
+        let mut p = self.rest.clone();
+        let mut out = Vec::with_capacity(n + 1);
+        for k in 0..=n {
+            let t = (k as f32 / faith_move::TurnCurves::RATE).min(len);
+            pose::sample(sq, &self.map, &self.rest, t * sq.rate, false, &mut p);
+            out.push(p.pos[0]);
+        }
+        let first = out.first().copied().unwrap_or_default();
+        Some(out.into_iter().map(|v| v - first).collect())
+    }
+
     fn want(&mut self, key: &str, src: Source, blend: f32) {
         if self.layers.last().is_some_and(|l| l.key == key && !l.dying) {
             return;
@@ -448,6 +480,8 @@ impl Driver {
             },
             MeleeKind::SlideKick => self.oneshot_rate("MeleeSlide", arms, 1.0, 0.1, 0.1),
             MeleeKind::WallRunKick => self.oneshot_rate(lr("MeleeWallRunLeft", "MeleeWallRunRight"), arms, 1.0, 0.1, 0.2),
+            // TdMove_MeleeVault.TriggerMove: PlayMoveAnim(MeleeVaultOver, 1.0, 0.1, 0.1).
+            MeleeKind::VaultKick => self.oneshot_rate("MeleeVaultOver", arms, 1.0, 0.1, 0.1),
         }
     }
 
@@ -726,7 +760,37 @@ impl Driver {
                 MoveEvent::SwingStart => self.oneshot("swinghardstart", arms, None, 0.15),
                 // TdMove_Swing.JumpOff: SwingJumpOff (1.0, in 0.2, out 0.2).
                 MoveEvent::SwingJump => self.oneshot_rate("swingjumpoff", arms, 1.0, 0.2, 0.2),
+                // TdMove_IntoClimb.PlayStartAnimation (LadderEnterTop is the state's own).
+                MoveEvent::ClimbStart { start, pipe } => {
+                    let (seq, blend_in) = match (start, pipe) {
+                        (ClimbStart::HangLeft, false) => ("LadderClimbHangStartLeft", 0.15),
+                        (ClimbStart::HangLeft, true) => ("PipeClimbHangStartLeft", 0.15),
+                        (ClimbStart::HangRight, false) => ("LadderClimbHangStartRight", 0.15),
+                        (ClimbStart::HangRight, true) => ("PipeClimbHangStartRight", 0.15),
+                        // The ladder's hard start isn't in Faith's AnimSet: the soft one.
+                        (ClimbStart::HangHard, false) | (ClimbStart::Hang, false) => ("LadderClimbHangStart", 0.1),
+                        (ClimbStart::HangHard, true) => ("PipeClimbHangStartHard", 0.1),
+                        (ClimbStart::Hang, true) => ("PipeClimbHangStart", 0.1),
+                        (ClimbStart::PipeStart, _) => ("PipeClimbStart", 0.15),
+                        (ClimbStart::None, _) | (ClimbStart::EnterTop, _) => ("", 0.0),
+                    };
+                    if !seq.is_empty() {
+                        self.oneshot_rate(seq, arms, 1.0, blend_in, 0.25);
+                    }
+                }
+                // TdMove_Climb.LetGo: PipeExitBottom (1.0, in 0.1, out 0.4).
+                MoveEvent::ClimbLetGo => self.oneshot_rate("PipeExitBottom", arms, 1.0, 0.1, 0.4),
+                // TdMove_SwingJump.StartMove: SwingOff (1.0, in 0.2, out 0.2).
+                MoveEvent::SwingToSwing => self.oneshot_rate("swingoff", arms, 1.0, 0.2, 0.2),
                 MoveEvent::Melee { kind, left } => self.melee(kind, left, c, arms),
+                // TdMove_AutoStepUp.StartMove: autostepuprightleg (0.8, in 0.15, out 0.25).
+                MoveEvent::StepUp => self.oneshot_rate("autostepuprightleg", arms, 0.8, 0.15, 0.25),
+                // TdMove_RumpSlide.StartSliding: crouchslideintoend45 (1.0, in 0.15, out 0.2).
+                MoveEvent::RumpSlide => self.oneshot_rate("crouchslideintoend45", arms, 1.0, 0.15, 0.2),
+                // TdMove_Vertigo.StartMove: PlayMoveAnim(edgedetection, 1.0, in 0.28, out 0.28).
+                MoveEvent::Vertigo => self.oneshot_rate("edgedetection", arms, 1.0, 0.28, 0.28),
+                // TdMove_GrabTransfer.PlayTransferAnimation: hangtransferup (1.0, in 0.1, out 0.1).
+                MoveEvent::GrabTransfer => self.oneshot_rate("hangtransferup", arms, 1.0, 0.1, 0.1),
                 // TdMOVE_Disarm.PlayDisarmStart: PlayMoveAnim(DisarmAnim, 1.0, in 0.1, out 0.2).
                 MoveEvent::Takedown { anim, .. } => {
                     let seq = faith_move::TAKEDOWN_ANIMS[(anim as usize).min(3)];
@@ -742,6 +806,13 @@ impl Driver {
             if matches!(c.state, MoveState::Ground | MoveState::Air) {
                 self.oneshot_from(v.anim(), arms, v.t, 0.0);
                 self.set_blend_out(0.2);
+            }
+        }
+        // TdMove_Vertigo.StopMove: StopCustomAnim(0.4).
+        if matches!(prev, Some(MoveState::Vertigo { .. })) && !matches!(c.state, MoveState::Vertigo { .. }) {
+            if self.oneshot.as_ref().is_some_and(|o| o.key == "edgedetection") {
+                self.oneshot = None;
+                self.pending_blend = Some(0.4);
             }
         }
         // TdMove_Slide.StopMove: crouchslidetocrouch (blend in 0.1, out 0.2).
@@ -784,7 +855,7 @@ impl Driver {
         // A one-shot keeps playing until it ends, unless the move changed kind.
         let kind_changed = prev.is_some_and(|p| std::mem::discriminant(&p) != std::mem::discriminant(&c.state));
         if let Some(o) = &self.oneshot {
-            let hard_state = matches!(c.state, MoveState::Traverse(_) | MoveState::Vault(_) | MoveState::LayOnGround { .. } | MoveState::Barge { .. } | MoveState::Stumble { .. } | MoveState::SoftLand { .. } | MoveState::LedgeHang { .. } | MoveState::Roll { .. } | MoveState::Slide { .. });
+            let hard_state = matches!(c.state, MoveState::Traverse(_) | MoveState::Vault(_) | MoveState::LayOnGround { .. } | MoveState::Barge { .. } | MoveState::AirBarge { .. } | MoveState::IntoClimb { .. } | MoveState::Climb { .. } | MoveState::ClimbExit { .. } | MoveState::Stumble { .. } | MoveState::SoftLand { .. } | MoveState::LedgeHang { .. } | MoveState::Roll { .. } | MoveState::Slide { .. });
             // A move's own one-shot survives only while you're still in that
             // move: the grab must not keep playing into the pull-up (that
             // left the hands reaching far above the ledge as you climbed).
@@ -795,6 +866,14 @@ impl Driver {
                 MoveState::ZipLine { .. } => o.key.starts_with("zipline"),
                 MoveState::Barge { .. } => o.key == "meleekickobject" || o.key == "bargeoutleft",
                 MoveState::Takedown { .. } => o.key.starts_with("Snatch"),
+                MoveState::StepUp { .. } => o.key == "autostepuprightleg",
+                MoveState::RumpSlide { .. } => o.key == "crouchslideintoend45",
+                MoveState::GrabTransfer { .. } => o.key == "hangtransferup",
+                MoveState::Vertigo { .. } => o.key == "edgedetection",
+                MoveState::SwingJump { .. } => o.key == "swingoff",
+                MoveState::IntoClimb { .. } => o.key.contains("ClimbHangStart") || o.key == "PipeClimbStart",
+                // The start clip plays on over the hold (move input waits for it).
+                MoveState::Climb { mv: None, fast: false, .. } => o.key.contains("ClimbHangStart") || o.key == "PipeClimbStart",
                 _ => false,
             };
             // A standing landing gives way as soon as you run off; so does an idle.
@@ -805,7 +884,7 @@ impl Driver {
             // jump: touching down ends it, blending out over the move's JumpBlendOutTime (0.2).
             // The dodge clips run 0.83 s against ~0.4 s in the air, so without this the dodge
             // pose would hang on over the run cycle.
-            let air_clip = ["dodgejump", "wallrunjump", "JumpSlow", "JumpTurnFly", "swingjumpoff", "MeleeInAir", "MeleeFromAbove", "SpringBoard"]
+            let air_clip = ["dodgejump", "wallrunjump", "JumpSlow", "JumpTurnFly", "swingjumpoff", "swingoff", "MeleeInAir", "MeleeFromAbove", "SpringBoard"]
                 .iter()
                 .any(|k| o.key.to_ascii_lowercase().starts_with(&k.to_ascii_lowercase()));
             let touched_down = prev.is_some_and(|p| matches!(p, MoveState::Air))
@@ -838,6 +917,53 @@ impl Driver {
                         let _ = back;
                         self.want("loco", Source::Loco, 0.2);
                     }
+                }
+                // TdMove_IntoClimb: LadderEnterTop (in 0.25) over the top; else onto the step.
+                MoveState::IntoClimb { t, entering: true, .. } => {
+                    self.want("LadderEnterTop", Source::Driven { seq: "LadderEnterTop", time: t }, 0.25);
+                }
+                MoveState::IntoClimb { ladder, .. } => {
+                    let seq = if ladder.pipe { "PipeClimbUpLeftHandStill" } else { "LadderClimbUpLeftHandStill" };
+                    self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: true }, 0.15);
+                }
+                // TdMove_Climb.Climb: the step's clip (in 0.1), backwards going down, kept in step
+                // with the move.
+                MoveState::Climb { ladder, mv: Some(m), .. } if m.anim.is_some() => {
+                    let seq = climb_clip(ladder.pipe, m.anim.unwrap_or(0));
+                    let len = Self::length(arms, seq).unwrap_or(0.33);
+                    let k = (m.t / m.dur.max(1e-3)).clamp(0.0, 1.0);
+                    let time = if m.down { (1.0 - k) * len } else { k * len };
+                    let key = format!("{seq}#{}", if m.down { "down" } else { "up" });
+                    self.want(&key, Source::Driven { seq, time }, 0.1);
+                }
+                // Sliding down: ...ClimbDownFast, looping (ClimbDownBlendInTime 0.5).
+                MoveState::Climb { ladder, fast: true, .. } => {
+                    let seq = if ladder.pipe { "PipeClimbDownFast" } else { "LadderClimbDownFast" };
+                    self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: true }, 0.5);
+                }
+                // Holding on: the hand's still pose (IdleBlendInTime 0.05).
+                MoveState::Climb { ladder, left, .. } => {
+                    let seq = match (ladder.pipe, left) {
+                        (false, true) => "LadderClimbUpLeftHandStill",
+                        (false, false) => "LadderClimbUpRightHandStill",
+                        (true, true) => "PipeClimbUpLeftHandStill",
+                        (true, false) => "PipeClimbUpRightHandStill",
+                    };
+                    self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: true }, 0.05);
+                }
+                // ExitAtTop: the exit clip (in 0.1).
+                MoveState::ClimbExit { ladder, t, left, .. } => {
+                    let seq = match (ladder.pipe, left) {
+                        (false, true) => "LadderExitTopLeftHand",
+                        (false, false) => "LadderExitTopRightHand",
+                        (true, true) => "pipeexittoplefthand",
+                        (true, false) => "pipeexittoprighthand",
+                    };
+                    self.want(seq, Source::Driven { seq, time: t }, 0.1);
+                }
+                MoveState::SwingJump { .. } => {
+                    let seq = self.air_clip;
+                    self.want(seq, Source::Play { seq, time: 0.0, rate: 1.0, looping: false }, 0.2);
                 }
                 MoveState::Air => {
                     if c.soft_brace {
@@ -920,7 +1046,22 @@ impl Driver {
                     self.want("meleekickobject", Source::Driven { seq: "meleekickobject", time: t }, 0.1);
                 }
                 // Its clip is a one-shot (the event); without one, standing.
-                MoveState::Takedown { .. } => self.want("loco", Source::Loco, 0.2),
+                MoveState::Takedown { .. } | MoveState::StepUp { .. } | MoveState::Vertigo { .. } => self.want("loco", Source::Loco, 0.2),
+                // TdMove_AirBarge: AirBargeIdle (in 0.15), AirBargeImpact (in 0), AirBargeLand
+                // (in 0.1).
+                MoveState::AirBarge { t, phase, .. } => {
+                    let (seq, blend) = match phase {
+                        AirBargePhase::Flying => ("AirBargeIdle", 0.15),
+                        AirBargePhase::Impact => ("AirBargeImpact", 0.0),
+                        AirBargePhase::Landing => ("AirBargeLand", 0.1),
+                    };
+                    self.want(seq, Source::Driven { seq, time: t }, blend);
+                }
+                MoveState::GrabTransfer { .. } => self.want("Hang", Source::Play { seq: "Hang", time: 0.0, rate: 1.0, looping: true }, 0.2),
+                // AT_C1P's rumpslide state: crouchslideend45, looping.
+                MoveState::RumpSlide { .. } => {
+                    self.want("crouchslideend45", Source::Play { seq: "crouchslideend45", time: 0.0, rate: 1.0, looping: true }, 0.2)
+                }
                 // TdMove_Stumble.PlayStumbleAnimation: StumbleFwd (blend 0.3), or GetHitStumbleBwd
                 // (blend 0.1).
                 MoveState::Stumble { t, forward, .. } => {
@@ -1018,6 +1159,13 @@ impl Driver {
                     MoveState::Vault(v) => v.t,
                     MoveState::LayOnGround { t, getting_up, .. } => getting_up.unwrap_or(t),
                     MoveState::Stumble { t, .. } | MoveState::SoftLand { t } => t,
+                    MoveState::AirBarge { t, .. } => t,
+                    MoveState::IntoClimb { t, entering: true, .. } | MoveState::ClimbExit { t, .. } => t,
+                    MoveState::Climb { mv: Some(m), .. } => {
+                        let len = Self::length(arms, seq).unwrap_or(0.33);
+                        let k = (m.t / m.dur.max(1e-3)).clamp(0.0, 1.0);
+                        if m.down { (1.0 - k) * len } else { k * len }
+                    }
                     MoveState::LedgeHang { .. } => c.shimmy.map_or(*time, |sh| sh.t),
                     _ => *time,
                 };
@@ -1064,6 +1212,7 @@ impl Driver {
             .max_by(|a, b| a.weight.total_cmp(&b.weight))
             .map(|l| (l.seq, l.sync));
         let mut fired = std::mem::take(&mut self.fired);
+        let mut loco_seq = self.loco_notify_seq;
         for l in &mut self.layers {
             let (seq, now, looping) = match &l.src {
                 Source::Play { seq, time, looping, .. } => (Some(*seq), *time, *looping),
@@ -1072,7 +1221,15 @@ impl Driver {
                 Source::Loco => {
                     let len = loco_name.and_then(|(n, _)| arms.anims.sequences.get(n)).map_or(1.0, |s| s.length);
                     let sync = loco_name.map_or(0.0, |(_, s)| s);
-                    (loco_name.map(|(n, _)| n), (self.loco_phase + sync).fract() * len, true)
+                    let name = loco_name.map(|(n, _)| n);
+                    // Each cycle has its own time (an AnimNodeSequence each): when another
+                    // takes over, its steps count from now, not from the last one's time
+                    // (which, compared across two cycles, crossed every step between).
+                    if name != loco_seq {
+                        loco_seq = name;
+                        l.last = (self.loco_phase + sync).fract() * len;
+                    }
+                    (name, (self.loco_phase + sync).fract() * len, true)
                 }
             };
             // A clip that's just been played fires its notifies from its first frame, even as it
@@ -1088,6 +1245,7 @@ impl Driver {
             l.last = now;
         }
         self.fired = fired;
+        self.loco_notify_seq = loco_seq;
 
         // ---- pose
         let mut blended = self.rest.clone();

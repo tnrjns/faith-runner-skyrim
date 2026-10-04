@@ -22,6 +22,7 @@ namespace faith
 		float         bodyCameraForward = 5.0f;   // whole-body view: the camera this far ahead of her eye (units)
 		float         bodyCameraForwardDown = 10.0f;  // ... and this much more looking straight down
 		bool          worldFixtures = true;       // Skyrim's own cables, bars and planks as ziplines, swing poles, beams
+		bool          autoStepUp = true;          // steps up onto knee-high steps (Mirror's Edge's own, off in the game)
 		bool          bodyScreenMatch = true;     // Skyrim's body's hands where Faith's appear on screen
 		bool          heldInGrip = true;          // her fingers close round what Skyrim's hands hold
 		float         heldRange = 60.0f;          // ... anything Skyrim drew this close (units) counts as held
@@ -30,6 +31,7 @@ namespace faith
 		float         meleeDamageMult = 1.0f;     // x Mirror's Edge's damage (its hit points as Skyrim's health)
 		std::uint32_t takedownKey = 0x2F;         // Mirror's Edge's disarm on whoever's in front of her (V)
 		bool          takedownKills = true;       // a takedown finishes them (else they're staggered and fight on)
+		std::uint32_t reactionKey = 0x2D;         // Mirror's Edge's Reaction Time (X)
 		std::uint32_t respawnKey = 0x13;          // on a training course: back to the checkpoint (R)
 		float         courseHeight = 20000.0f;    // how far above you a training course is put (units)
 		std::uint32_t surveyKey = 0x44;           // saves the collision around you for the parkour tool (F10)

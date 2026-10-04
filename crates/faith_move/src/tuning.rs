@@ -340,6 +340,13 @@ pub struct Tuning {
     pub melee_clips: MeleeClips,
     /// The takedown clips' lengths (takedown::TAKEDOWN_ANIMS): each takedown lasts its clip.
     pub takedown_clips: [f32; 4],
+    /// TdMove_AirBarge's clips: AirBargeIdle, AirBargeImpact, AirBargeLand.
+    pub air_barge_clips: [f32; 3],
+    /// The ladder clips' root motion (ExitAtTop, LadderEnterTop), when the host has them.
+    pub climb_curves: Option<std::sync::Arc<crate::climb::ClimbCurves>>,
+    /// TdMove_AutoStepUp: walking into something 35-48 uu high steps up onto it. Mirror's Edge
+    /// ships it switched off (its levels ramp their stairs); for hosts whose stairs aren't.
+    pub auto_step_up: bool,
     /// ME: TdMove_MeleeCrouch.SpeedModifier = 0.2 / guess for standing
     pub melee_speed: f32,
 }
@@ -507,6 +514,9 @@ impl Default for Tuning {
 
             melee_clips: MeleeClips::default(),
             takedown_clips: [2.53, 2.10, 2.03, 1.97],
+            air_barge_clips: [1.0, 0.6, 0.8],
+            climb_curves: None,
+            auto_step_up: false,
             melee_speed: 0.4,
         }
     }
@@ -538,6 +548,8 @@ pub struct MeleeClips {
     /// TdMove_MeleeSlide: MeleeSlide. TdMove_MeleeWallrun: MeleeWallRunLeft.
     pub slide: f32,
     pub wallrun: f32,
+    /// TdMove_MeleeVault: MeleeVaultOver.
+    pub vault_kick: f32,
 }
 
 impl Default for MeleeClips {
@@ -554,6 +566,7 @@ impl Default for MeleeClips {
             air_hit: 0.6,
             slide: 0.9,
             wallrun: 0.7,
+            vault_kick: 0.8,
         }
     }
 }

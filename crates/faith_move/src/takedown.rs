@@ -8,11 +8,13 @@
 //!   (SnatchFwd, SnatchFwd2, SnatchFwd3, as for a patrol cop's light weapon). The game compares
 //!   the two pawns' facings; here it's their facing against the way to them, so what plays
 //!   matches where they actually stand.
-//! - **Where** (StartMove / AlignPawn): she slides to DisarmOffset (125.899) short of them, at
-//!   max(400, speed) uu/s, facing them. Their side of it (the enemy's clip) is placed facing her
-//!   for all four: that's where the two clips' hands meet (from behind too: the clip turns the
-//!   body itself: measured with the two clips side by side). If she can't get there they're brought to
-//!   her instead (HandlePlayerUnableToMove).
+//! - **Where**: the game slides her to DisarmOffset (125.899) short of them and turns *them* to
+//!   face her (or away). Here they're left as they stand, and she goes to where the clips put
+//!   her against them: DisarmOffset in front of them for a front snatch, behind them for the
+//!   one from behind, facing them (at max(400, speed) uu/s, as AlignPawn). Both clips are
+//!   authored from her spot: the enemy's has him DisarmOffset ahead of its origin, facing her or
+//!   away; so the enemy's side is placed at her spot, turned the way she faces (`clip_at`,
+//!   `clip_dir`). If she can't get there she takes it from where she is.
 //! - **How long**: the clip (OnCustomAnimEnd); look and move input are ignored throughout
 //!   (DisableLookTime / DisableMovementTime -1), the view swings onto them (UpdateMeleeAutoLockOn)
 //!   and levels (ResetCameraLook 0.2).
@@ -53,8 +55,7 @@ impl Controller {
             return false;
         }
         let centre = self.centre();
-        let fwd = forward(self.yaw);
-        let Some(t) = pick(&self.targets, REACH, centre, fwd) else { return false };
+        let Some(t) = pick(&self.targets, REACH, centre, forward(self.yaw)) else { return false };
         let d = t.centre - centre;
         if (t.centre.y - centre.y).abs() > uu(70.0) || horiz(d).length() > REACH {
             return false;
@@ -67,20 +68,22 @@ impl Controller {
         let anim = if back { 3 } else { (self.takedowns % 3) as u8 };
         self.takedowns += 1;
 
+        // Where the clips put her against them: in front of them (they face her), or behind.
+        let their = if horiz(t.facing).length_squared() > 1e-6 { horiz(t.facing).normalize() } else { -toward };
+        let base = Vec3::new(t.centre.x, self.feet.y, t.centre.z);
         let body = self.body();
-        let mut to = Vec3::new(t.centre.x, self.feet.y, t.centre.z) - toward * OFFSET;
-        let mut enemy_at = t.centre;
-        let mut face = yaw_of(toward);
+        let mut to = if back { base - their * OFFSET } else { base + their * OFFSET };
+        let mut clip_dir = if back { their } else { -their };
         if world.sweep(body.aabb(Vec3::ZERO).size() * 0.5, self.feet + Vec3::Y * (body.height * 0.5 + 0.05), to - self.feet).is_some() {
+            // Can't get round them: from where she is, at them.
             to = self.feet;
-            enemy_at = Vec3::new(centre.x, t.centre.y, centre.z) + fwd * OFFSET;
-            face = self.yaw;
+            clip_dir = toward;
         }
-        let enemy_dir = -forward(face);
+        let face = yaw_of(clip_dir);
         let len = self.tuning.takedown_clips[anim as usize];
         self.vel = Vec3::ZERO;
         self.state = State::Takedown { t: 0.0, len, target: t.id, from: self.feet, to, face };
-        self.events.push(Event::Takedown { target: t.id, anim, enemy_at, enemy_dir });
+        self.events.push(Event::Takedown { target: t.id, anim, enemy_at: t.centre, enemy_dir: their, clip_at: to, clip_dir });
         true
     }
 

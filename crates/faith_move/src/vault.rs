@@ -83,6 +83,12 @@ pub struct Vault {
     pub exit_vel: Vec3,
     /// Landing past the obstacle with nothing under you (bEndMoveFalling).
     pub falling: bool,
+    /// Attack pressed during it (TdMove_SpeedVault.HandleMoveAction: bEndMoveInMelee; every
+    /// vault type has bMeleePossible): the way down becomes TdMove_MeleeVault's kick.
+    pub kick: bool,
+    /// At the end before the kick's hit detection came on: she stays there, still, until it's
+    /// over (TdMove_MeleeVault.ReachedPreciseLocation only restores the speed with bHitDetection).
+    pub held: bool,
 }
 
 impl Vault {
@@ -266,5 +272,7 @@ pub fn plan(world: &dyn World, tu: &Tuning, body: Body, feet: Vec3, vel: Vec3, f
         end,
         exit_vel: dir * exit_speed,
         falling: falling && !onto,
+        kick: false,
+        held: false,
     })
 }

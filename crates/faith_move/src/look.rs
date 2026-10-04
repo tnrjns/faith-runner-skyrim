@@ -51,6 +51,8 @@ pub fn look_limit(c: &Controller) -> LookLimit {
         State::WallClimb { .. } | State::WallClimbTurned { .. } => FREE,
         // TdMove_Grab
         State::LedgeHang { .. } => l(-3200, 16000, None),
+        // TdMove_GrabTransfer: look input ignored (DisableLookTime -1); held as the hang.
+        State::GrabTransfer { .. } => l(-3200, 16000, None),
         State::Traverse(tr) => match tr.kind {
             // TdMove_SpeedVault / TdMove_StepUp
             TraverseKind::Vault | TraverseKind::Mantle => l(-3000, 6000, Some(8000)),
@@ -74,6 +76,17 @@ pub fn look_limit(c: &Controller) -> LookLimit {
         State::Swing { .. } => l(-11000, 16384, None),
         // TdMOVE_Disarm: bConstrainLook off (the look input is ignored instead)
         State::Takedown { .. } => FREE,
+        // DisableLookTime -1: the look is held instead (Controller::step).
+        State::AirBarge { .. } => FREE,
+        // TdMove_AutoStepUp (no constraint)
+        State::StepUp { .. } => FREE,
+        // TdMove_RumpSlide
+        State::RumpSlide { .. } => l(-5000, 5000, Some(5000)),
+        State::Vertigo { .. } => FREE,
+        State::SwingJump { .. } => l(-11000, 16384, None),
+        // TdMove_IntoClimb: look input ignored (DisableLookTime -1); TdMove_Climb.
+        State::IntoClimb { .. } | State::ClimbExit { .. } => FREE,
+        State::Climb { .. } => l(-5000, 10000, Some(32000)),
     }
 }
 

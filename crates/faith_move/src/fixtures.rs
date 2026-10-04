@@ -7,6 +7,9 @@
 //!   and both sides of it, and nothing within 2.2 m below (it's not a handrail).
 //! - **Balance beam:** level, at least 2.5 m long, 10-50 cm wide, with a drop of 1.5 m or more on
 //!   both sides and headroom above (a plank across a gap, not a walkway).
+//! - **Drainpipe** (TdLadderVolume, LT_Pipe): upright, at most 10 cm thick and 2.5 m or more
+//!   long, against a wall (within 30 cm of it) with room to climb in front, up to a top she can
+//!   climb out onto (a floor behind it, 1.5 m or more up and no higher than the pipe).
 
 use glam::Vec3;
 
@@ -118,6 +121,35 @@ fn beam(world: &MeshWorld, c: &Candidate) -> Option<Fixture> {
     Some(Fixture::Beam { a, b })
 }
 
+fn drainpipe(world: &MeshWorld, c: &Candidate) -> Option<Fixture> {
+    let (lo, hi) = if c.a.y <= c.b.y { (c.a, c.b) } else { (c.b, c.a) };
+    let d = hi - lo;
+    if c.thickness > 0.1 || d.length() < 2.5 || horiz(d).length() > d.y * 5f32.to_radians().tan() {
+        return None;
+    }
+    let mid = (lo + hi) * 0.5;
+    // The wall behind it: the nearest solid round the pipe within 30 cm, with room on the
+    // other side.
+    let mut best: Option<(f32, Vec3)> = None;
+    for k in 0..16 {
+        let a = k as f32 * std::f32::consts::TAU / 16.0;
+        let dir = Vec3::new(a.cos(), 0.0, a.sin());
+        let start = mid + dir * (c.thickness + 0.02);
+        let Some(h) = world.sweep(Vec3::new(0.01, 0.3, 0.01), start, dir * 0.3) else { continue };
+        if !free(world, mid - dir * 0.62, Vec3::new(0.3, 0.8, 0.3)) {
+            continue;
+        }
+        if best.is_none_or(|b| h.t < b.0) {
+            best = Some((h.t, -dir));
+        }
+    }
+    let normal = best?.1;
+    // The top to climb out onto: a floor behind it.
+    let back = Vec3::new(hi.x, hi.y + 0.2, hi.z) - normal * (c.thickness + 0.35);
+    let top = *tops_below(world, back, 0.1, back.y, lo.y + 1.5).first()?;
+    Some(Fixture::Ladder(crate::climb::Ladder { base: lo, top, normal, pipe: true }))
+}
+
 /// The candidates that work as Mirror's Edge's fixtures. Pieces of one bar or cable that meet
 /// end to end come as several candidates; each is judged by itself.
 pub fn classify(world: &MeshWorld, candidates: &[Candidate]) -> Vec<Fixture> {
@@ -126,11 +158,12 @@ pub fn classify(world: &MeshWorld, candidates: &[Candidate]) -> Vec<Fixture> {
         if !(c.a.is_finite() && c.b.is_finite() && c.thickness.is_finite()) {
             continue;
         }
-        let f = zipline(world, c).or_else(|| swing_pole(world, c)).or_else(|| beam(world, c));
+        let f = zipline(world, c).or_else(|| swing_pole(world, c)).or_else(|| beam(world, c)).or_else(|| drainpipe(world, c));
         let Some(f) = f else { continue };
         // The same thing twice (overlapping shapes): keep one.
         let key = |f: &Fixture| match *f {
             Fixture::ZipLine { a, b } | Fixture::SwingPole { a, b } | Fixture::Beam { a, b } => (a + b) * 0.5,
+            Fixture::Ladder(l) => l.base,
             _ => Vec3::ZERO,
         };
         if out.iter().any(|o| std::mem::discriminant(o) == std::mem::discriminant(&f) && key(o).distance(key(&f)) < 0.3) {
@@ -176,6 +209,20 @@ mod tests {
         assert!(matches!(classify(&w, &[bar])[..], [Fixture::SwingPole { .. }]));
         let rail = cap(Vec3::new(-2.0, 1.0, 0.0), Vec3::new(2.0, 1.0, 0.0), 0.04);
         assert!(classify(&w, &[rail]).is_empty());
+    }
+
+    #[test]
+    fn a_pipe_up_a_wall_is_a_drainpipe_but_a_lamp_post_isnt() {
+        // A building 5 m high, its face at z = 0 (out along +Z), a pipe 15 cm out from it.
+        let mut tris = ground(0.0);
+        tris.extend(MeshWorld::oriented_box(Vec3::new(0.0, 2.5, -3.0), Vec3::new(4.0, 2.5, 3.0), 0.0));
+        let w = MeshWorld::new(tris, vec![]);
+        let pipe = cap(Vec3::new(0.0, 0.0, 0.15), Vec3::new(0.0, 5.6, 0.15), 0.05);
+        let found = classify(&w, &[pipe]);
+        assert!(matches!(found[..], [Fixture::Ladder(l)] if l.pipe && (l.top - 5.0).abs() < 0.05 && l.normal.z > 0.9), "{found:?}");
+        // Standing by itself: no wall, no top.
+        let post = cap(Vec3::new(10.0, 0.0, 10.0), Vec3::new(10.0, 5.0, 10.0), 0.06);
+        assert!(classify(&w, &[post]).is_empty());
     }
 
     #[test]

@@ -257,6 +257,11 @@ fn mesh(c: &Course, doors_open: &[f32]) -> Vec<(Vec3, Vec3, Vec2, u32)> {
                 push_box(&mut out, &b, look_index(Look::Prop), Quat::from_rotation_y(sign * k * 100f32.to_radians()), hinge);
             }
             Fixture::BarbedWire { b } => push_box(&mut out, &b, METAL, Quat::IDENTITY, Vec3::ZERO),
+            Fixture::Ladder(l) => {
+                for (a, b, thick) in l.rods() {
+                    push_rod(&mut out, a, b, thick);
+                }
+            }
             Fixture::Beam { .. } | Fixture::SoftPad { .. } => {}
         }
     }

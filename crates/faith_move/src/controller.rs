@@ -10,7 +10,9 @@ use glam::{Vec2, Vec3};
 use crate::locomotion::{RunInput, RunState};
 use crate::tuning::Tuning;
 use crate::vault::{self, Vault};
-use crate::world::{closest_on_segment, column_top, find_ledge, move_axis, slide_move, probe_wall, trace_box, trace_wall, Aabb, Body, Fixture, WallHit, WithDoors, World};
+pub use crate::climb::{ClimbStart, ClimbStep, Ladder};
+pub use crate::airbarge::AirBargePhase;
+use crate::world::{closest_on_segment, column_top, find_ledge, move_axis, slide_move, probe_wall, tops_below, trace_box, trace_wall, Aabb, Body, Fixture, WallHit, WithDoors, World};
 
 /// One frame of player input. Buttons are "pressed this frame" edges plus
 /// "held" levels; `look` is the mouse/stick delta in radians.
@@ -47,6 +49,8 @@ pub enum MeleeKind {
     WallRunKick,
     /// Crouched (TdMove_MeleeCrouch): MeleeCrouchStart, then MeleeCrouchHit.
     Crouch,
+    /// Kick on the way down from a vault (TdMove_MeleeVault): MeleeVaultOver.
+    VaultKick,
 }
 
 /// Where an attack is (TdMove_MeleeBase.MeleeState).
@@ -124,6 +128,8 @@ pub enum State {
     /// Barging a door (TdMove_Barge): `hands` shoulder-first at a run, else a kick.
     /// `rate`: BargeInLeft's play rate, BargeAnimTime over the time to the door (0.7..1.3).
     Barge { t: f32, door: usize, hands: bool, hit: bool, dir: Vec3, rate: f32 },
+    /// Into a door from the air (TdMove_AirBarge): `boost` is the height boost still to come.
+    AirBarge { t: f32, door: usize, phase: AirBargePhase, boost: f32 },
     /// Tripped by barbed wire (TdMove_Stumble), `forward` over it or back from it.
     Stumble { t: f32, forward: bool, dir: Vec3 },
     /// Landed a big drop on something soft (TdMove_Landing.LandOnSoftObject).
@@ -142,6 +148,26 @@ pub enum State {
     /// Taking someone down (TdMOVE_Disarm, `takedown`): sliding from `from` to `to`, turning to
     /// `face`, for the clip's `len`.
     Takedown { t: f32, len: f32, target: u32, from: Vec3, to: Vec3, face: f32 },
+    /// Stepping up onto something knee-high (TdMove_AutoStepUp, `stepup`): straight from
+    /// `from` to `to` over `dur`, then on at `saved`.
+    StepUp { t: f32, from: Vec3, to: Vec3, dur: f32, saved: Vec3 },
+    /// Sliding down a slope too steep to stand on (TdMove_RumpSlide, `rumpslide`): `air` counts
+    /// time off it, `face` is down the slope.
+    RumpSlide { t: f32, air: f32, face: f32 },
+    /// Stopped at a long drop, looking over it (TdMove_Vertigo); `edge` is the point past it.
+    Vertigo { t: f32, edge: Vec3 },
+    /// Carried from one swing bar to the next (TdMove_SwingJump), to `to` (feet) at `speed`.
+    SwingJump { t: f32, to: Vec3, speed: f32 },
+    /// Getting onto a ladder (TdMove_IntoClimb): to `to` (feet) over `dur`; over the top,
+    /// `entering` is LadderEnterTop's part from `from`.
+    IntoClimb { t: f32, ladder: Ladder, from: Vec3, to: Vec3, dur: f32, start: ClimbStart, entering: bool },
+    /// On a ladder (TdMove_Climb): on `step`, maybe moving (`mv`), sliding down (`fast`), move
+    /// input ignored for `hold`.
+    Climb { ladder: Ladder, step: i32, mv: Option<ClimbStep>, left: bool, fast: bool, hold: f32 },
+    /// Over the top of a ladder (TdMove_Climb.ExitAtTop), from `from` (feet).
+    ClimbExit { ladder: Ladder, t: f32, from: Vec3, left: bool },
+    /// Reaching up from one ledge to another above (TdMove_GrabTransfer, `grabtransfer`).
+    GrabTransfer { t: f32, from: Vec3, to: Vec3, dur: f32, normal: Vec3, ledge_y: f32 },
 }
 
 impl State {
@@ -173,9 +199,18 @@ impl State {
             State::LayOnGround { .. } => "Getting up",
             State::Barge { hands: true, .. } => "Barge",
             State::Barge { .. } => "Kick",
+            State::AirBarge { .. } => "Air barge",
             State::Stumble { .. } => "Stumble",
             State::SoftLand { .. } => "Soft landing",
             State::Takedown { .. } => "Takedown",
+            State::StepUp { .. } => "Step up",
+            State::RumpSlide { .. } => "Rump slide",
+            State::Vertigo { .. } => "Vertigo",
+            State::SwingJump { .. } => "Swing jump",
+            State::IntoClimb { .. } => "Onto ladder",
+            State::Climb { .. } => "Ladder",
+            State::ClimbExit { .. } => "Off ladder",
+            State::GrabTransfer { .. } => "Grab transfer",
         }
     }
 }
@@ -210,6 +245,24 @@ pub enum Event {
     BackRoll,
     /// Started barging (`hands`) or kicking a door.
     Barge { hands: bool },
+    /// TdMove_AirBarge: started (AirBargeIdle), through the door (AirBargeImpact), touching
+    /// down (AirBargeLand).
+    AirBarge,
+    AirBargeImpact,
+    /// TdMove_Vertigo started.
+    Vertigo,
+    /// TdMove_SwingJump: off one bar at the next (SwingOff).
+    SwingToSwing,
+    /// TdMove_IntoClimb's start clip (PlayStartAnimation, or LadderEnterTop).
+    ClimbStart { start: ClimbStart, pipe: bool },
+    /// TdMove_Climb: a step up or down, over the top, letting go (PipeExitBottom), sliding down
+    /// and stopping.
+    ClimbStep,
+    ClimbExit,
+    ClimbLetGo,
+    ClimbSlide,
+    ClimbSlideEnd,
+    AirBargeLand,
     /// A door was knocked open (fixture index).
     DoorOpened { door: usize },
     /// Tripped on barbed wire.
@@ -225,11 +278,18 @@ pub enum Event {
     BalanceStart,
     BalanceFall,
     /// A takedown started on `target` (TdMOVE_Disarm): `anim` indexes
-    /// `takedown::TAKEDOWN_ANIMS`; the host puts them at `enemy_at`, their clip placed facing
-    /// `enemy_dir` (towards her, for every takedown).
-    Takedown { target: u32, anim: u8, enemy_at: Vec3, enemy_dir: Vec3 },
+    /// `takedown::TAKEDOWN_ANIMS`. They stay at `enemy_at` facing `enemy_dir` (as they stood);
+    /// their side of it (the enemy's clip) is placed at `clip_at` (her spot, feet) turned to
+    /// `clip_dir` (the way she faces them).
+    Takedown { target: u32, anim: u8, enemy_at: Vec3, enemy_dir: Vec3, clip_at: Vec3, clip_dir: Vec3 },
     /// The takedown's clip ended: what becomes of them is the host's call.
     TakedownDone { target: u32 },
+    /// Stepped up onto something knee-high (TdMove_AutoStepUp).
+    StepUp,
+    /// Started sliding down a slope too steep to stand on (TdMove_RumpSlide).
+    RumpSlide,
+    /// Reached up from a ledge to the one above (TdMove_GrabTransfer).
+    GrabTransfer,
     ZipStart,
     /// TdMove_ZipLine.PrepareForForwardImpact: something solid within 600 units ahead.
     ZipBrace,
@@ -394,7 +454,7 @@ pub struct Controller {
     /// Falling toward a soft landing object fast enough to brace (TdMove_SoftLanding).
     pub soft_brace: bool,
     /// The doors' boxes by fixture index (None for other fixtures).
-    doors: Vec<Option<Aabb>>,
+    pub(crate) doors: Vec<Option<Aabb>>,
     /// Shimmying along (or round the corner of) the ledge you hang from.
     pub shimmy: Option<Shimmy>,
     pub crouched: bool,
@@ -404,9 +464,9 @@ pub struct Controller {
     pub spawn_yaw: f32,
     pub events: Vec<Event>,
 
-    air_time: f32,
-    jumped_since_ground: bool,
-    jump_buffer: f32,
+    pub(crate) air_time: f32,
+    pub(crate) jumped_since_ground: bool,
+    pub(crate) jump_buffer: f32,
     /// Seconds since the last crouch press that counted as a roll trigger (TdPawn.RollTriggerTime).
     roll_trigger_age: f32,
     takeoff: Takeoff,
@@ -446,7 +506,9 @@ pub struct Controller {
     /// Knocked back off an air kick: no air control until she lands.
     pub(crate) melee_no_input: bool,
     /// Lighter gravity just after leaving a swing pole.
-    low_grav: f32,
+    pub(crate) low_grav: f32,
+    /// The GravityModifier while `low_grav` lasts.
+    pub(crate) low_grav_k: f32,
     /// In TdMove_DodgeJump (see `dodge_jump`).
     dodging: bool,
     /// The move's view look-at (TdMove_WallRun's turn).
@@ -458,7 +520,7 @@ pub struct Controller {
     /// TdMove_DodgeJump.RedoMoveTime: no new dodge until this runs out.
     dodge_redo: f32,
     /// Can't re-grab a zipline or pole straight after letting go.
-    fixture_cooldown: f32,
+    pub(crate) fixture_cooldown: f32,
     /// On a zipline: braced for the wall ahead (ZLS_CloseToEnd); whether you came onto it from
     /// its left (the ZipLine loop then starts half way through); the ZiplineStart rate.
     pub zip_braced: bool,
@@ -472,9 +534,21 @@ pub struct Controller {
     /// Her vertical speed as she caught the last ledge (TdMove_IntoGrab.IntoGrabSpeed, m/s):
     /// which grab-impact clip plays.
     pub grab_speed: f32,
+    /// How far her mesh (and with it the camera) is held below or above her feet after a step
+    /// up or down (ATdPawn's TargetMeshTranslationZ smoothing): it eases back to them.
+    pub mesh_offset: f32,
+    /// TdMove_RumpSlide.RedoMoveTime: not again for a second after one.
+    pub(crate) rump_redo: f32,
+    /// TdMove_Vertigo: RedoMoveTime left, and the last edge it looked over.
+    pub(crate) vertigo_redo: f32,
+    /// TdMove_IntoClimb.RedoMoveTime after letting go of a ladder.
+    pub(crate) climb_redo: f32,
+    pub(crate) last_vertigo_edge: Option<Vec3>,
+    /// TdMove_Vertigo's zoom to ZoomFOV is on (StartZoom; off at UnZoom).
+    pub vertigo_zoom: bool,
     springboard: Option<SpringRunIn>,
     /// Seconds since grabbing the current ledge.
-    hang_time: f32,
+    pub(crate) hang_time: f32,
 }
 
 const SUBSTEP: f32 = 1.0 / 120.0;
@@ -482,7 +556,7 @@ const SUBSTEP: f32 = 1.0 / 120.0;
 pub(crate) fn forward(yaw: f32) -> Vec3 {
     Vec3::new(-yaw.sin(), 0.0, -yaw.cos())
 }
-fn right(yaw: f32) -> Vec3 {
+pub(crate) fn right(yaw: f32) -> Vec3 {
     Vec3::new(yaw.cos(), 0.0, -yaw.sin())
 }
 pub(crate) fn horiz(v: Vec3) -> Vec3 {
@@ -542,6 +616,7 @@ impl Controller {
             speed_log: Default::default(),
             melee_no_input: false,
             low_grav: 0.0,
+            low_grav_k: 1.0,
             dodging: false,
             look_at: None,
             wall_turned: false,
@@ -554,6 +629,12 @@ impl Controller {
             takedowns: 0,
             wallrun_wall_above: true,
             grab_speed: 0.0,
+            mesh_offset: 0.0,
+            rump_redo: 0.0,
+            vertigo_redo: 0.0,
+            climb_redo: 0.0,
+            last_vertigo_edge: None,
+            vertigo_zoom: false,
             springboard: None,
             hang_time: 0.0,
             shimmy: None,
@@ -671,6 +752,11 @@ impl Controller {
             self.pitch -= self.pitch * (dt / 0.3).min(1.0);
         }
         // TdMOVE_Disarm: DisableLookTime / DisableMovementTime -1, for the whole move.
+        self.vertigo_input(&mut input);
+        // TdMove_AirBarge, TdMove_IntoClimb: DisableLookTime -1; ExitAtTop ignores it for 0.9 s.
+        if matches!(self.state, State::AirBarge { .. } | State::IntoClimb { .. }) || matches!(self.state, State::ClimbExit { t, .. } if t < 0.9) {
+            input.look = Vec2::ZERO;
+        }
         if matches!(self.state, State::Takedown { .. }) {
             input.look = Vec2::ZERO;
             input.move_axis = Vec2::ZERO;
@@ -729,6 +815,7 @@ impl Controller {
             first = false;
         }
         self.melee_tick(dt.min(0.1));
+        self.smooth_mesh(dt.min(0.1));
         if self.state == State::Ground {
             self.melee_no_input = false;
         }
@@ -861,6 +948,10 @@ impl Controller {
             self.events.push(Event::Taunt);
             return;
         }
+        // PlayerWalking.HandleMoveAction: in the air, the air barge before the air kick.
+        if self.state == State::Air && self.try_air_barge() {
+            return;
+        }
         let kind = match self.state {
             State::Ground if self.crouched => MeleeKind::Crouch,
             State::Ground => MeleeKind::Punch,
@@ -869,6 +960,12 @@ impl Controller {
             State::Air => MeleeKind::AirKick,
             State::Slide { .. } => MeleeKind::SlideKick,
             State::WallRun { .. } => MeleeKind::WallRunKick,
+            // TdMove_SpeedVault.HandleMoveAction: the vault ends in the kick (vault_step).
+            State::Vault(mut v) => {
+                v.kick = true;
+                self.state = State::Vault(v);
+                return;
+            }
             _ => return,
         };
         self.melee_left = !self.melee_left;
@@ -897,7 +994,7 @@ impl Controller {
             MeleeKind::WallRunKick => self.start_wallrun_kick(&mut m),
             // TdMove_MeleeSlide.TriggerMove: SetTimer(0.2542) turns the hit detection on.
             MeleeKind::SlideKick => m.detect_in = Some(0.2542),
-            MeleeKind::Punch | MeleeKind::Crouch => {}
+            MeleeKind::Punch | MeleeKind::Crouch | MeleeKind::VaultKick => {}
         }
         self.melee = Some(m);
         self.events.push(Event::Melee { kind, left });
@@ -920,7 +1017,7 @@ impl Controller {
         p.y - self.feet.y
     }
 
-    fn grounded(&self, world: &dyn World) -> bool {
+    pub(crate) fn grounded(&self, world: &dyn World) -> bool {
         let hw = self.tuning.half_width - 0.01;
         let region = Aabb::new(
             self.feet + Vec3::new(-hw, -0.05, -hw),
@@ -988,6 +1085,9 @@ impl Controller {
         self.regrab_cooldown = (self.regrab_cooldown - dt).max(0.0);
         self.low_grav = (self.low_grav - dt).max(0.0);
         self.fixture_cooldown = (self.fixture_cooldown - dt).max(0.0);
+        self.rump_redo = (self.rump_redo - dt).max(0.0);
+        self.vertigo_redo = (self.vertigo_redo - dt).max(0.0);
+        self.climb_redo = (self.climb_redo - dt).max(0.0);
         if self.dodging && self.state != State::Air {
             self.end_dodge();
         }
@@ -1011,12 +1111,21 @@ impl Controller {
             State::Vault(v) => self.vault_step(dt, v, world),
             State::LayOnGround { t, getting_up, back_roll } => self.lay_on_ground(dt, t, getting_up, back_roll, input, world),
             State::Barge { t, door, hands, hit, dir, rate } => self.barge(dt, t, door, hands, hit, dir, rate, world),
+            State::AirBarge { t, door, phase, boost } => self.air_barge(dt, t, door, phase, boost, world),
             State::Stumble { t, forward, dir } => self.stumble(dt, t, forward, dir, world),
             State::SoftLand { t } => self.soft_land(dt, t, world),
             State::Balance { a, b, lean, danger, t } => self.balance(dt, a, b, lean, danger, t, input, world),
             State::ZipLine { a, b, s, speed } => self.zipline(dt, a, b, s, speed, input, world),
             State::Swing { a, b, at, dir, angle, rate } => self.swing(dt, a, b, at, dir, angle, rate, input, world),
             State::Takedown { t, len, target, from, to, face } => self.takedown(dt, t, len, target, from, to, face),
+            State::StepUp { t, from, to, dur, saved } => self.step_up(dt, t, from, to, dur, saved),
+            State::RumpSlide { t, air, face } => self.rump_slide(dt, t, air, face, input.move_axis.x, world),
+            State::Vertigo { t, edge } => self.vertigo(dt, t, edge, input),
+            State::SwingJump { t, to, speed } => self.swing_jump(dt, t, to, speed, world),
+            State::IntoClimb { t, ladder, from, to, dur, start, entering } => self.into_climb(dt, t, ladder, from, to, dur, start, entering),
+            State::Climb { ladder, step, mv, left, fast, hold } => self.climb(dt, ladder, step, mv, left, fast, hold, input, world),
+            State::ClimbExit { ladder, t, from, left } => self.climb_exit(dt, ladder, t, from, left, input, world),
+            State::GrabTransfer { t, from, to, dur, normal, ledge_y } => self.grab_transfer(dt, t, from, to, dur, normal, ledge_y),
         }
 
         self.check_barbed_wire(world);
@@ -1045,7 +1154,14 @@ impl Controller {
         self.air_time = 0.0;
         self.climbed_this_air = false;
         self.last_wall_normal = None;
+        if self.try_into_climb(input, world) {
+            return;
+        }
 
+        // On ground too steep to stand on: sliding down it.
+        if self.try_rump_slide(world) {
+            return;
+        }
         if !self.crouched && self.try_balance(world) {
             return;
         }
@@ -1063,6 +1179,10 @@ impl Controller {
             self.crouched = true;
         } else {
             self.try_stand(world);
+        }
+        // Walking into something knee-high: step up onto it (when the host turns it on).
+        if tu.auto_step_up && !self.crouched && input.move_axis.y > 0.2 && self.try_auto_step_up(world) {
+            return;
         }
 
         if self.springboard.is_some() {
@@ -1119,6 +1239,10 @@ impl Controller {
         self.vel = Vec3::new(h.x, 0.0, h.z);
         self.sprint_charge = (self.run.energy / (tu.loco.ground_speed - tu.loco.max_base)).clamp(0.0, 1.0);
 
+        // The walking edge check: a long drop ahead may stop her (TdMove_Vertigo).
+        if self.try_vertigo(world) {
+            return;
+        }
         self.integrate(dt, world, true);
     }
 
@@ -1298,6 +1422,15 @@ impl Controller {
     // ---------------------------------------------------------------- air
 
     fn air(&mut self, dt: f32, input: &Input, world: &dyn World) {
+        // TdLadderVolume.PawnUpdate.
+        if self.try_into_climb(input, world) {
+            return;
+        }
+        // Coming down on ground too steep to stand on: the rump slide (TdMove_Falling hands over
+        // to it as the walk would).
+        if self.vel.y <= 0.0 && self.try_rump_slide(world) {
+            return;
+        }
         let tu = self.tuning.clone();
         self.air_time += dt;
 
@@ -1349,7 +1482,7 @@ impl Controller {
         }
         let accel = want.clamp_length_max(max);
         let nh = h + accel * dt;
-        let g = if self.low_grav > 0.0 { tu.gravity * tu.swing_exit_gravity } else { tu.gravity };
+        let g = if self.low_grav > 0.0 { tu.gravity * self.low_grav_k } else { tu.gravity };
         self.vel = Vec3::new(nh.x, self.vel.y - g * dt, nh.z);
 
         self.integrate(dt, world, false);
@@ -1780,21 +1913,7 @@ impl Controller {
         let speed = h.length();
         let forward_moving = speed > 0.01 && fwd.dot(h / speed) > 0.707;
         let barge_speed = (speed + tu.barge_add_speed).min(tu.barge_max_speed);
-        let reach = if forward_moving { tu.barge_min_trace.max(barge_speed * tu.barge_trace_time) } else { tu.barge_min_trace };
-        let centre = self.feet + Vec3::Y * (tu.stand_height * 0.5);
-        let door = self.doors.iter().enumerate().find_map(|(i, b)| {
-            let b = (*b)?;
-            if self.doors_open.get(i).is_some_and(|&o| o > 0.0) {
-                return None;
-            }
-            // Trace from the cylinder centre straight ahead: the door and how far it is.
-            let steps = (reach / 0.05).ceil() as usize;
-            (0..=steps).map(|k| reach * k as f32 / steps.max(1) as f32).find(|&d| {
-                let p = centre + fwd * d;
-                p.x >= b.min.x && p.x <= b.max.x && p.y >= b.min.y && p.y <= b.max.y && p.z >= b.min.z && p.z <= b.max.z
-            }).map(|d| (i, d))
-        });
-        let Some((door, dist)) = door else { return false };
+        let Some((door, dist)) = self.door_ahead(tu.barge_min_trace) else { return false };
         let hands = speed > tu.barge_kick_threshold && forward_moving;
         let dir = if hands { h / speed } else { fwd };
         // StartBargin: BargeInLeft at BargeAnimTime / TimeToDoor, clamped to 0.7..1.3.
@@ -1843,7 +1962,7 @@ impl Controller {
         }
     }
 
-    fn open_door(&mut self, door: usize) {
+    pub(crate) fn open_door(&mut self, door: usize) {
         if let Some(o) = self.doors_open.get_mut(door) {
             if *o == 0.0 {
                 *o = 1e-3;
@@ -1917,6 +2036,9 @@ impl Controller {
     // ---------------------------------------------------------------- walls
 
     fn wallrun(&mut self, dt: f32, n: Vec3, t: f32, input: &Input, world: &dyn World) {
+        if self.try_into_climb(input, world) {
+            return;
+        }
         let tu = self.tuning.clone();
         let t = t + dt;
         let body = self.body();
@@ -2082,6 +2204,11 @@ impl Controller {
         // Let the grab land first (the game's grab animation settles before
         // you can heave up).
         let settled = self.hang_time >= tu.hang_settle_time;
+        // TdMove_Grab's MA_Jump: a transfer to a ledge above first (pushing up), then the pull-up.
+        if settled && self.jump_buffer > 0.0 && input.move_axis.y > 0.5 && self.try_grab_transfer(n, ledge_y, world) {
+            self.jump_buffer = 0.0;
+            return;
+        }
         if settled && (self.jump_buffer > 0.0 || input.move_axis.y > 0.5) {
             self.jump_buffer = 0.0;
             let stand = Body { half_width: tu.half_width, height: tu.stand_height };
@@ -2216,15 +2343,32 @@ impl Controller {
     /// TdMove_SpeedVault.UpdateVaultMovement: up to the hand-plant, over, down to the end; then
     /// walking (onto, or over onto the floor) or falling, at the speed of the last leg.
     fn vault_step(&mut self, dt: f32, mut v: Vault, world: &dyn World) {
+        let k = v.kind();
+        let down_at = k.time_up + k.time_over;
+        let was = v.t;
         v.t += dt;
         self.vel = Vec3::ZERO;
+        // bEndMoveInMelee: the way down is TdMove_MeleeVault's (the same SetPreciseLocation to
+        // VaultEndPosition over VaultTimeDown), its kick 0.3 s in (StartMove's SetTimer).
+        if v.kick && was < down_at && v.t >= down_at && self.melee.is_none() {
+            self.start_vault_kick();
+        }
+        let kicking = v.kick && self.melee.is_some_and(|m| m.kind == MeleeKind::VaultKick);
         if v.t < v.duration() {
             self.feet = v.position(v.t);
             self.state = State::Vault(v);
             return;
         }
+        if kicking && (v.held || !self.melee.is_some_and(|m| m.detecting || m.detect_in.is_none())) {
+            // Reached the end before the kick: still there (PHYS_Flying) until it's over.
+            v.held = true;
+            self.feet = v.end;
+            self.state = State::Vault(v);
+            return;
+        }
         self.feet = v.end;
-        self.vel = v.exit_vel;
+        // SetStoredVelocity: the way down's speed, no falling speed kept (Z = max(0, Z)).
+        self.vel = if v.held { Vec3::ZERO } else if kicking { Vec3::new(v.exit_vel.x, v.exit_vel.y.max(0.0), v.exit_vel.z) } else { v.exit_vel };
         self.air_time = 0.0;
         self.fall_peak = self.body_y();
         self.state = if v.falling || !self.grounded(world) { State::Air } else { State::Ground };
@@ -2358,7 +2502,7 @@ impl Controller {
     }
 
     /// Catch a zipline or swing pole from the air.
-    fn try_grab_fixture(&mut self, world: &dyn World) -> bool {
+    pub(crate) fn try_grab_fixture(&mut self, world: &dyn World) -> bool {
         if self.fixture_cooldown > 0.0 {
             return false;
         }
@@ -2429,7 +2573,7 @@ impl Controller {
                     self.events.push(Event::SwingStart);
                     return true;
                 }
-                Fixture::Beam { .. } | Fixture::Door { .. } | Fixture::BarbedWire { .. } | Fixture::SoftPad { .. } => {}
+                Fixture::Beam { .. } | Fixture::Door { .. } | Fixture::BarbedWire { .. } | Fixture::SoftPad { .. } | Fixture::Ladder(_) => {}
             }
         }
         false
@@ -2500,9 +2644,15 @@ impl Controller {
         let tangent = |angle: f32, rate: f32| (dir * angle.cos() + Vec3::Y * angle.sin()) * rate * l;
         // Jump off on the forward swing.
         if self.jump_buffer > 0.0 && rate > 0.5 {
+            // TdMove_Swing.JumpOff: another bar ahead, and it's the swing-to-swing jump.
+            if let Some(target) = self.swing_target(a, b, at, dir, rate, world) {
+                self.start_swing_jump(target);
+                return;
+            }
             let sp = tu.swing_exit_speed.max(rate * l * angle.cos().max(0.0));
             self.vel = dir * sp + Vec3::Y * (tu.jump_speed * 0.5 + 3.0 * angle.sin().max(0.0));
             self.low_grav = tu.swing_exit_gravity_time;
+            self.low_grav_k = tu.swing_exit_gravity;
             self.let_go();
             self.events.push(Event::SwingJump);
             return;
@@ -2556,6 +2706,8 @@ impl Controller {
             let da = horiz(a - start).length_squared();
             let ds = horiz(s - start).length_squared();
             if ds > da + 1e-6 && s.y >= start.y - 1e-3 {
+                // A step up: the mesh stays where it was and follows (OffsetMeshZ).
+                self.offset_mesh(start.y - s.y);
                 a = s;
                 hit = stepped;
             }
@@ -2579,13 +2731,48 @@ impl Controller {
             }
         }
 
+        // Walked into a step with no front to it (some games' stairs are only their tops) or
+        // over a seam: onto its top, as the step-up would have, if there's room.
+        if on_ground {
+            let hw = body.half_width - 0.02;
+            // Where she is, and where she was going if something stopped her.
+            let want = start + Vec3::new(d.x, 0.0, d.z) + horiz(d).normalize_or_zero() * 0.03;
+            let short = horiz(want - self.feet).length() > 1e-4;
+            for at in [Some(self.feet), short.then_some(want)].into_iter().flatten() {
+                let Some(&top) = tops_below(world, at, hw, start.y + step_height, self.feet.y + 0.005).first() else { continue };
+                let up = Vec3::new(at.x, top, at.z);
+                if world.is_free(&body.aabb(up + Vec3::Y * 0.001)) {
+                    self.offset_mesh(self.feet.y - top);
+                    self.feet = up;
+                    break;
+                }
+            }
+        }
+
         // Stick to slopes/stairs going down.
         if on_ground && !self.grounded(world) {
             let mut s = self.feet;
             let h = move_axis(world, body, &mut s, 1, -step_height);
             if h.blocked {
+                self.offset_mesh(self.feet.y - s.y);
                 self.feet = s;
             }
+        }
+    }
+
+    /// ATdPawn::OffsetMeshZ (0x12ba240): the mesh shifted by `d`, kept within 24 uu of where it
+    /// belongs.
+    fn offset_mesh(&mut self, d: f32) {
+        self.mesh_offset = (self.mesh_offset + d).clamp(-uu(24.0), uu(24.0));
+    }
+
+    /// ATdPawn's mesh smoothing tick (0x12ba2e0): the mesh's height comes back to the pawn at
+    /// ten times the gap a second, never slower than 1 uu a tick.
+    fn smooth_mesh(&mut self, dt: f32) {
+        let gap = self.mesh_offset.abs();
+        if gap > 0.0 {
+            let step = (gap * dt * 10.0).max(uu(1.0)).min(gap);
+            self.mesh_offset -= self.mesh_offset.signum() * step;
         }
     }
 

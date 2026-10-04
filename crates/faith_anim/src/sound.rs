@@ -53,7 +53,7 @@ pub fn impact_cue(kind: faith_move::MeleeKind) -> &'static str {
     match kind {
         Punch => "A_Character_Melee.A_Female.Fist_Head",
         Crouch => "A_Character_Melee.A_Female.Fist_Body",
-        AirKick | SlideKick => "A_Character_Melee.A_Female.Foot_Body",
+        AirKick | SlideKick | VaultKick => "A_Character_Melee.A_Female.Foot_Body",
         WallRunKick => "A_Character_Melee.A_Female.Foot_Head",
     }
 }
@@ -212,12 +212,15 @@ pub struct Director {
     /// stops them when it ends, so they're stopped here when the movement state changes.
     move_loops: Vec<(u64, std::mem::Discriminant<MoveState>)>,
     run_wind: Option<(u64, f32)>,
+    /// Seconds since the last landing played: ground that jitters under her (something loose
+    /// she's standing on) can't fire one a frame.
+    since_land: f32,
 }
 
 impl Director {
     /// `cues`: what's loaded (lower-case path → info).
     pub fn new(cues: HashMap<String, CueInfo>) -> Self {
-        Director { cues, rng: 0x9E37_79B9_7F4A_7C15, next_id: 1, last_phase: 0.0, move_loops: vec![], run_wind: None }
+        Director { cues, rng: 0x9E37_79B9_7F4A_7C15, next_id: 1, last_phase: 0.0, move_loops: vec![], run_wind: None, since_land: 1.0 }
     }
 
     pub fn rand(&mut self) -> f32 {
@@ -281,6 +284,7 @@ impl Director {
         out: &mut Vec<SoundCmd>,
     ) {
         let speed = c.horizontal_speed();
+        self.since_land += dt;
 
         // ---- the rushing wind loop, started silent
         if self.run_wind.is_none() {
@@ -332,7 +336,9 @@ impl Director {
         // ---- gameplay events
         for e in c.events.clone() {
             match e {
+                MoveEvent::Land { .. } if self.since_land < 0.15 => {}
                 MoveEvent::Land { impact, .. } => {
+                    self.since_land = 0.0;
                     // Landing animations don't carry their own impact sound.
                     let n = if impact > 9.0 { 10 } else if impact > 6.0 { 9 } else { 8 };
                     self.step(n, surface(false), 1.0, &c.state, out);
@@ -352,7 +358,8 @@ impl Director {
                     }
                     self.step(9, surface(false), 1.0, &c.state, out);
                 }
-                MoveEvent::Slide => {
+                // TdMove_RumpSlide: the slide's scrape, as a slide.
+                MoveEvent::Slide | MoveEvent::RumpSlide => {
                     self.play_move("A_Character_Female_01.Body.BodySlide", 0.9, &c.state, out);
                     self.step(11, surface(false), 1.0, &c.state, out);
                 }

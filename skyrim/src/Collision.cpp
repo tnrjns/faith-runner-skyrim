@@ -729,8 +729,12 @@ namespace faith::Collision
 						continue;
 					}
 					++bodies;
-					if (!fixed) {
-						// Read where it is each frame instead (CollectMoving).
+					// What's animated (doors, gates, drawbridges: keyframed) is read where it is each
+					// frame instead (CollectMoving). Loose physics (crates, barrels, carts) is read
+					// with the rest: the player's capsule nudges it when Faith stands on it, and
+					// following that every frame made the ground under her jitter (a landing, and its
+					// step, every frame).
+					if (!fixed && entity->motion.type.get() == RE::hkpMotion::MotionType::kKeyframed) {
 						entity->AddReference();
 						a_moving.push_back(entity);
 						continue;

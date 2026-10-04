@@ -140,9 +140,98 @@ fn the_clips_the_moves_play_exist() {
         "JumpSlow", "JumpTurnFly", "dodgejumpleft", "dodgejumpright", "HangHardStart", "walkbalancefalloffleft", "walkbalancefalloffright",
         "wallrunrightstart", "wallrunleftstart", "WallRunVertical", "wallrunvertical180turn", "jumpcoil", "ziplinestart", "ZipLine",
         "ziplineintohitwall", "ziplinehitwall", "bargeinleft", "bargeoutleft", "meleekickobject", "crouchslidetocrouch", "fallinglandhard",
-        "fallinglandhard2", "HangHardStart2", "HangHardStart3", "gethitfront", "hangturnjump", "jumpstill", "jumpfast", "fallinglandroll",
+        "fallinglandhard2", "HangHardStart2", "HangHardStart3", "gethitfront", "hangturnjump", "autostepuprightleg", "crouchslideintoend45", "crouchslideend45", "hangtransferup", "jumpstill", "jumpfast", "fallinglandroll",
         "CrouchSlide", "Hang", "HangStrafeLeft", "HangStrafeRight", "HangHeaveUp", "VaultOver", "VaultOnto", "VaultOntoHigh", "RunTurn180", "StandTurn180Right", "SnatchFwd", "SnatchFwd2", "SnatchFwd3", "SnatchBack",
+        "MeleeVaultOver", "AirBargeIdle", "AirBargeImpact", "AirBargeLand", "edgedetection", "swingoff",
+        "LadderClimbHangStart", "LadderClimbHangStartLeft", "LadderClimbHangStartRight", "LadderEnterTop", "LadderClimbUpLeftHand",
+        "LadderClimbUpRightHand", "LadderClimbUpLeftHandStill", "LadderClimbUpRightHandStill", "LadderClimbDownFast", "LadderExitTopLeftHand",
+        "LadderExitTopRightHand", "PipeClimbHangStart", "PipeClimbHangStartHard", "PipeClimbHangStartLeft", "PipeClimbHangStartRight",
+        "PipeClimbStart", "PipeClimbUpLeftHand", "PipeClimbUpRightHand", "pipeclimbupfastlefthand", "pipeclimbupfastrighthand",
+        "PipeClimbUpLeftHandStill", "PipeClimbUpRightHandStill", "PipeClimbDownFast", "pipeexittoplefthand", "pipeexittoprighthand", "PipeExitBottom",
     ];
     let missing: Vec<_> = clips.iter().filter(|c| crate::Driver::length(&arms, c).is_none()).collect();
     assert!(missing.is_empty(), "missing: {missing:?}");
 }
+
+/// Walking over small things on the floor (clutter, kerbs, 5-30 cm) plays about as many step
+/// sounds as walking on the flat: no burst when she steps on one.
+#[test]
+fn stepping_on_small_things_doesnt_spam_steps() {
+    let Some(arms) = arms() else { return };
+    use crate::sound::{Director, SoundCmd};
+    use faith_move::greybox::Surface;
+    use faith_move::{Aabb, BoxWorld, CameraFx, Controller, Input, State, Tuning};
+    use glam::Vec3;
+    let count = |bumps: bool, stick: f32| {
+        let mut w = BoxWorld::default();
+        w.add(Aabb::new(Vec3::new(-50.0, -1.0, -50.0), Vec3::new(50.0, 0.0, 50.0)));
+        if bumps {
+            for i in 0..12 {
+                let h = [0.05, 0.12, 0.2, 0.3][i % 4];
+                let z = -1.5 - i as f32 * 0.9;
+                w.add(Aabb::new(Vec3::new(-2.0, 0.0, z - 0.3), Vec3::new(2.0, h, z)));
+            }
+        }
+        let mut c = Controller::new(Tuning::default(), Vec3::ZERO, 0.0);
+        c.state = State::Ground;
+        let mut fx = CameraFx::default();
+        let mut rig = crate::Rig::new(&arms, c.yaw);
+        let cues = crate::sound::wanted_cues(Some(&arms)).into_iter().map(|c| (c.to_ascii_lowercase(), crate::sound::CueInfo { variants: 1, volume: (1.0, 1.0), pitch: (1.0, 1.0), looping: false })).collect();
+        let mut d = Director::new(cues);
+        let (mut steps, mut lands, mut worst) = (0, 0, 0);
+        for _ in 0..(4 * 60) {
+            let input = Input { move_axis: glam::Vec2::new(0.0, stick), ..Default::default() };
+            c.step(1.0 / 60.0, &input, &w);
+            let shot = fx.update(1.0 / 60.0, &c, &input);
+            rig.update(1.0 / 60.0, &c, &shot, &arms);
+            let mut out = vec![];
+            d.update(1.0 / 60.0, &c, rig.driver.notifies(), true, 0.0, &|_| Surface::Concrete, &mut out);
+            let mut frame = 0;
+            for cmd in out {
+                if let SoundCmd::Play { cue, .. } = cmd {
+                    if cue.contains("footstep") {
+                        steps += 1;
+                        frame += 1;
+                        if cue.contains("land") {
+                            lands += 1;
+                        }
+                    }
+                }
+            }
+            worst = worst.max(frame);
+        }
+        (steps, lands, worst)
+    };
+    for stick in [0.5, 1.0] {
+        let flat = count(false, stick);
+        let bumpy = count(true, stick);
+        eprintln!("stick {stick}: flat {flat:?}, bumpy {bumpy:?} (steps, landings, most in a frame)");
+        assert!(bumpy.0 <= flat.0 + 8 && bumpy.2 <= 2, "stick {stick}: flat {flat:?} against bumpy {bumpy:?}");
+    }
+}
+
+/// A speed hovering on the walk / sneak line (the walking state flipping every frame, as
+/// stepping on something can make it) steps no more than steady walking does.
+#[test]
+fn a_flickering_walk_state_doesnt_spam_steps() {
+    let Some(arms) = arms() else { return };
+    use faith_move::{Controller, State, Tuning};
+    use me_assets::anim::Notify;
+    let steps = |flicker: bool| {
+        let mut c = Controller::new(Tuning::default(), glam::Vec3::ZERO, 0.0);
+        c.state = State::Ground;
+        let mut d = crate::Driver::new(&arms);
+        let mut n = 0;
+        for f in 0..(4 * 60) {
+            let speed = if flicker && f % 2 == 0 { 0.45 } else { 0.55 };
+            c.vel = glam::Vec3::new(0.0, 0.0, -speed);
+            d.update(1.0 / 60.0, &c, &arms);
+            n += d.notifies().iter().filter(|x| matches!(x, Notify::Footstep(_))).count();
+        }
+        n
+    };
+    let (steady, flicker) = (steps(false), steps(true));
+    eprintln!("steady {steady}, flickering {flicker}");
+    assert!(flicker <= steady * 2 + 2, "steady {steady} steps, flickering {flicker}");
+}
+

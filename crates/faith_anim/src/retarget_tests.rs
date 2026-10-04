@@ -440,22 +440,28 @@ fn the_victim_clip_onto_a_skyrim_skeleton() {
     }
 }
 
-/// Where Faith's hands and the cop's are through a takedown, the cop placed both ways round
-/// (its rest forward towards her, or away), Faith DisarmOffset (125.9 uu) from it: how close her
-/// hands come to his hands, gun and head over the clip, summed, for each placement. The
-/// placement the game uses is the one where they meet: facing her, for all four (from behind
-/// the clip turns him itself).
+/// Both takedown clips are authored from her spot: the cop's has him DisarmOffset (1.26 m)
+/// ahead of its origin, facing her for the front snatches and away for the one from behind. Laid
+/// out from one origin, the same way round, her hands meet his (hands, gun, head), closer than
+/// with his turned round.
 #[test]
-fn takedown_hands_meet_with_the_victim_facing_her() {
+fn takedown_clips_share_her_origin() {
     let Some(dir) = std::env::var_os("ME_INSTALL") else { return };
     use me_assets::*;
     let faith = FaithArms::load(std::path::Path::new(&dir), 4).unwrap();
     let cop = FaithArms::load_character(std::path::Path::new(&dir), VICTIM_PACKAGE, VICTIM_MESH, VICTIM_ANIMS, VICTIM_SET).unwrap();
-    for seq in ["SnatchFwd", "SnatchFwd2", "SnatchFwd3", "SnatchBack"] {
+    for (seq, faces_her) in [("SnatchFwd", true), ("SnatchFwd2", true), ("SnatchFwd3", true), ("SnatchBack", false)] {
         let len = faith.anims.sequences[seq].length.min(cop.anims.sequences[seq].length);
-        let her = Vec3::new(0.0, 0.0, 1.259);
-        for (label, cop_rot) in [("cop's rest forward towards her", Quat::from_rotation_y(std::f32::consts::PI)), ("away from her", Quat::IDENTITY)] {
-            let (mut fm, mut cm) = (vec![], vec![]);
+        let (mut fm, mut cm) = (vec![], vec![]);
+        // Where the cop stands, and which way he faces, at the start.
+        retarget::clip_globals(&cop, seq, 0.0, &mut cm);
+        let at = |m: &[Mat4], n: &str| to_view(m[cop.bone(n).unwrap()].w_axis.truncate());
+        let root = at(&cm, "root");
+        assert!((root.z + 1.259).abs() < 0.05 && root.x.abs() < 0.05, "{seq}: he starts DisarmOffset ahead: {root}");
+        let toes = (at(&cm, "LeftToeBase") - at(&cm, "LeftFoot")) + (at(&cm, "RightToeBase") - at(&cm, "RightFoot"));
+        assert_eq!(toes.z > 0.0, faces_her, "{seq}: facing her {faces_her}: toes {toes}");
+        let mut sums = vec![];
+        for (same, rot) in [(true, Quat::IDENTITY), (false, Quat::from_rotation_y(std::f32::consts::PI))] {
             let mut sum = 0.0;
             for fh in ["LeftHand", "RightHand"] {
                 let mut best = f32::MAX;
@@ -463,21 +469,17 @@ fn takedown_hands_meet_with_the_victim_facing_her() {
                 while t < len {
                     retarget::clip_globals(&faith, seq, t, &mut fm);
                     retarget::clip_globals(&cop, seq, t, &mut cm);
-                    let a = her + to_view(fm[faith.bone(fh).unwrap()].w_axis.truncate());
+                    let a = to_view(fm[faith.bone(fh).unwrap()].w_axis.truncate());
                     for ch in ["LeftHand", "RightHand", "RightWeapon", "Head"] {
-                        let b = cop_rot * to_view(cm[cop.bone(ch).unwrap()].w_axis.truncate());
-                        best = best.min(a.distance(b));
+                        best = best.min(a.distance(rot * to_view(cm[cop.bone(ch).unwrap()].w_axis.truncate())));
                     }
                     t += 1.0 / 30.0;
                 }
                 sum += best;
             }
-            eprintln!("{seq}, {label}: her hands' closest {sum:.2} m (both summed)");
-            if label.starts_with("cop's") {
-                assert!(sum < 0.6, "{seq}: facing her, her hands come within {sum:.2} m");
-            } else {
-                assert!(sum > 1.0, "{seq}: facing away, still {sum:.2} m");
-            }
+            eprintln!("{seq}, {}: her hands' closest {sum:.2} m (both summed)", if same { "same origin" } else { "turned round" });
+            sums.push(sum);
         }
+        assert!(sums[0] < 0.4 && sums[0] < sums[1], "{seq}: from one origin her hands come within {:.2} m (turned round {:.2})", sums[0], sums[1]);
     }
 }

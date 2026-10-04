@@ -15,7 +15,8 @@ pub struct FaithFixtureCandidate {
     pub capsule: u32,
 }
 
-/// A fixture found (host frame): `kind` 0 zipline (a the high end), 1 swing pole, 2 balance beam.
+/// A fixture found (host frame): `kind` 0 zipline (a the high end), 1 swing pole, 2 balance beam,
+/// 3 drainpipe (a its foot, b the top she climbs out onto).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FaithFixture {
@@ -49,6 +50,7 @@ pub unsafe extern "C" fn faith_world_fixtures(h: *mut Faith, out: *mut FaithFixt
                 faith_move::Fixture::ZipLine { a, b } => Some((0, a, b)),
                 faith_move::Fixture::SwingPole { a, b } => Some((1, a, b)),
                 faith_move::Fixture::Beam { a, b } => Some((2, a, b)),
+                faith_move::Fixture::Ladder(l) => Some((3, l.base, glam::Vec3::new(l.base.x, l.top, l.base.z))),
                 _ => None,
             })
             .map(|(kind, a, b)| FaithFixture { kind, a: f.host(a).into(), b: f.host(b).into() })

@@ -197,7 +197,9 @@ fn melee_picks_the_attack_from_the_move() {
     });
     // Jump kick.
     let (mut jj, mut kk) = (false, false);
-    // (Not in the jump's first 0.1 s: TdMove_MeleeAir.CanDoMove.)
+    // (Not in the jump's first 0.1 s: TdMove_MeleeAir.CanDoMove.) Turned away from the door
+    // ahead: at it, it's the air barge.
+    s.c.yaw += std::f32::consts::PI;
     let mut air = 0;
     s.run(1.5, |c, _| {
         let mut i = Input::default();
@@ -207,6 +209,6 @@ fn melee_picks_the_attack_from_the_move() {
         i
     });
     // Running, it's a punch too: Faith has no running kick (TdMove_Melee for any ground speed).
-    assert_eq!(kinds(&s), vec![MeleeKind::Punch, MeleeKind::Punch, MeleeKind::AirKick]);
+    assert_eq!(kinds(&s), vec![MeleeKind::Punch, MeleeKind::Punch, MeleeKind::AirKick], "{:?}", s.events);
     assert!(s.c.melee.is_none(), "attack never ended");
 }

@@ -22,8 +22,10 @@ pub struct FaithTarget {
     pub facing: FaithVec3,
 }
 
-/// A takedown (faith_takedowns): started (`done` 0: put the target at `enemy_at` facing
-/// `enemy_dir`, host frame) or finished (`done` 1). `anim` 0-2 a front snatch, 3 from behind.
+/// A takedown (faith_takedowns): started (`done` 0) or finished (`done` 1). The target stays at
+/// `enemy_at` facing `enemy_dir` (as it stood); its side of it (faith_pose_victim) is placed at
+/// `clip_at` (her spot, feet) facing `clip_dir`. Host frame. `anim` 0-2 a front snatch, 3 from
+/// behind.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FaithTakedown {
@@ -32,6 +34,8 @@ pub struct FaithTakedown {
     pub done: u32,
     pub enemy_at: FaithVec3,
     pub enemy_dir: FaithVec3,
+    pub clip_at: FaithVec3,
+    pub clip_dir: FaithVec3,
 }
 
 /// An attack that landed: Mirror's Edge's damage (its hit points), and the momentum the blow

@@ -38,6 +38,7 @@ namespace faith::Input
 		bool jumpPressed = false, crouchPressed = false, turnPressed = false, meleePressed = false;
 		bool togglePressed = false, viewmodelPressed = false, idlePressed = false, surveyPressed = false, respawnPressed = false;
 		bool takedownPressed = false;
+		bool reactionPressed = false;
 		// Skyrim's always-run toggle, for Faith: walking (the keys as half a stick, as on a pad).
 		bool walking = false, walkChanged = false;
 		std::atomic<bool> onCourse{ false };
@@ -60,6 +61,7 @@ namespace faith::Input
 			case Pad::kX:
 			case Pad::kRightTrigger:
 			case Pad::kRightThumb:
+			case Pad::kLeftThumb:
 				return true;
 			case Pad::kBack:
 				return a_onCourse;
@@ -142,6 +144,9 @@ namespace faith::Input
 								if (isDown && code == GetConfig().takedownKey && !menu) {
 									takedownPressed = true;
 								}
+								if (isDown && code == GetConfig().reactionKey && !menu) {
+									reactionPressed = true;
+								}
 								if (isDown && code == GetConfig().surveyKey && !menu) {
 									surveyPressed = true;
 								}
@@ -185,6 +190,9 @@ namespace faith::Input
 								case Pad::kRightThumb:
 									takedownPressed |= isDown;
 									break;
+								case Pad::kLeftThumb:
+									reactionPressed |= isDown;
+									break;
 								default:
 									break;
 								}
@@ -214,7 +222,7 @@ namespace faith::Input
 					const auto code = button->GetIDCode();
 					if (button->GetDevice() == RE::INPUT_DEVICE::kKeyboard) {
 						return IsFaithKey(code) || code == GetConfig().toggleKey || code == GetConfig().viewmodelKey || code == GetConfig().idleKey ||
-						       code == GetConfig().takedownKey ||
+						       code == GetConfig().takedownKey || code == GetConfig().reactionKey ||
 						       code == GetConfig().walkKey ||
 						       (onCourse && code == GetConfig().respawnKey);
 					}
@@ -322,7 +330,8 @@ namespace faith::Input
 		in.turn_pressed = turnPressed;
 		in.melee_pressed = meleePressed;
 		in.takedown_pressed = takedownPressed;
-		jumpPressed = crouchPressed = turnPressed = meleePressed = takedownPressed = false;
+		in.reaction_pressed = reactionPressed;
+		jumpPressed = crouchPressed = turnPressed = meleePressed = takedownPressed = reactionPressed = false;
 		lookDx = lookDy = 0.0f;
 		return in;
 	}
@@ -377,7 +386,7 @@ namespace faith::Input
 	{
 		down.fill(false);
 		mouseLeft = false;
-		jumpPressed = crouchPressed = turnPressed = meleePressed = takedownPressed = false;
+		jumpPressed = crouchPressed = turnPressed = meleePressed = takedownPressed = reactionPressed = false;
 		lookDx = lookDy = 0.0f;
 		stickL[0] = stickL[1] = stickR[0] = stickR[1] = 0.0f;
 		padJump = padCrouch = false;

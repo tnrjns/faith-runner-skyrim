@@ -65,8 +65,9 @@ namespace faith
 		{
 			RE::ActorHandle actor;
 			RE::NiPoint3    at;
-			float           heading = 0.0f;  // which way their clip is placed (towards her)
-			float           from = 0.0f;     // where they faced: they turn over 0.25 s, not at once
+			float           heading = 0.0f;      // as they stood: they aren't turned
+			RE::NiPoint3    clipAt;              // their side of it laid out from her spot...
+			float           clipHeading = 0.0f;  // ...the way she faces them
 			std::uint32_t   anim = 0;
 			float           time = 0.0f;
 			// Its skeleton, bound to the victim side (Mirror's Edge's enemy clip), if it could be.
@@ -95,17 +96,6 @@ namespace faith
 			return s.id >= 0 ? &s : nullptr;
 		}
 
-		// Which way the one taken down faces now: from where they did to the takedown's, eased over
-		// 0.25 s.
-		float TakenHeading()
-		{
-			const float k = std::clamp(takenDown->time / 0.25f, 0.0f, 1.0f);
-			const float e = k * k * (3.0f - 2.0f * k);
-			float       d = takenDown->heading - takenDown->from;
-			d = std::remainder(d, 2.0f * RE::NI_PI);
-			return takenDown->from + d * e;
-		}
-
 		// The victim plays Mirror's Edge's enemy side of the takedown, over its own animation.
 		void PoseVictim()
 		{
@@ -116,9 +106,9 @@ namespace faith
 			if (!actor || actor->IsDead()) {
 				return;
 			}
-			// Their side of it is placed as the game places it, facing her, from the start (its
-			// hands meet hers there); only the actor underneath turns over 0.25 s.
-			takenDown->skeleton->ApplyVictim(faith, actor->Get3D(false), takenDown->anim, takenDown->time, takenDown->at, takenDown->heading);
+			// The clip is laid out from her spot, the way she faces them (as the game authored it:
+			// he's DisarmOffset ahead of its origin, facing her or away as they already stand).
+			takenDown->skeleton->ApplyVictim(faith, actor->Get3D(false), takenDown->anim, takenDown->time, takenDown->clipAt, takenDown->clipHeading);
 		}
 		// On a course, people stand on it (only Faith collides with it): where each is held, and
 		// its character controller's gravity to give back after.
@@ -473,11 +463,11 @@ namespace faith
 			if (found != lastFixtures) {
 				std::vector<FaithFixture> list(found);
 				faith_world_fixtures(faith, list.data(), found);
-				int counts[3]{};
+				int counts[4]{};
 				for (const auto& f : list) {
-					++counts[std::min<std::uint32_t>(f.kind, 2)];
+					++counts[std::min<std::uint32_t>(f.kind, 3)];
 				}
-				logger::info("fixtures around Faith: {} ziplines, {} swing poles, {} beams (of {} thin pieces)", counts[0], counts[1], counts[2], a_candidates.size());
+				logger::info("fixtures around Faith: {} ziplines, {} swing poles, {} beams, {} drainpipes (of {} thin pieces)", counts[0], counts[1], counts[2], counts[3], a_candidates.size());
 				lastFixtures = found;
 			}
 		}
@@ -554,8 +544,33 @@ namespace faith
 		void StopCourse(RE::PlayerCharacter* a_player);
 		void Sneak(RE::PlayerCharacter* a_player, float a_delta, bool a_off = false, bool a_held = false);
 
+		// Mirror's Edge's Reaction Time: the game's speed as faith_ffi says (Skyrim's global time
+		// multiplier, so everything slows, Faith too), and a word when the meter fills.
+		float lastGameSpeed = 1.0f;
+		float lastReaction = 100.0f;
+		void ReactionTime(bool a_off = false)
+		{
+			const float speed = a_off || !haveFrame ? 1.0f : std::clamp(frame.game_speed, 0.05f, 1.0f);
+			if (std::fabs(speed - lastGameSpeed) > 1e-3f) {
+				if (auto* timer = RE::BSTimer::GetSingleton()) {
+					timer->SetGlobalTimeMultiplier(speed, true);
+				}
+				if (lastGameSpeed >= 1.0f && speed < 1.0f) {
+					Notify("Reaction Time");
+				}
+				lastGameSpeed = speed;
+			}
+			if (!a_off && haveFrame) {
+				if (lastReaction < 100.0f && frame.reaction_energy >= 100.0f) {
+					Notify("Reaction Time ready");
+				}
+				lastReaction = frame.reaction_energy;
+			}
+		}
+
 		void Disable(RE::PlayerCharacter* a_player)
 		{
+			ReactionTime(true);
 			StopCourse(a_player);
 			Collision::Forget();
 			Sneak(a_player, 0.0f, true);
@@ -697,7 +712,8 @@ namespace faith
 					t.actor = actor->GetHandle();
 					t.at = { d.enemy_at.x, d.enemy_at.y, d.enemy_at.z - targets[d.target].half_height };
 					t.heading = std::atan2(d.enemy_dir.x, d.enemy_dir.y);
-					t.from = actor->GetAngleZ();
+					t.clipAt = { d.clip_at.x, d.clip_at.y, d.clip_at.z };
+					t.clipHeading = std::atan2(d.clip_dir.x, d.clip_dir.y);
 					t.anim = d.anim;
 					// Humanoids play the enemy's side (Skyrim's NPC skeleton); others just stand.
 					if (actor->HasKeywordString("ActorTypeNPC")) {
@@ -738,7 +754,7 @@ namespace faith
 			if (takenDown) {
 				if (auto actor = takenDown->actor.get(); actor && !actor->IsDead()) {
 					actor->SetPosition(takenDown->at, true);
-					actor->SetHeading(TakenHeading());
+					actor->SetHeading(takenDown->heading);
 					PoseVictim();
 				} else {
 					takenDown.reset();
@@ -1025,6 +1041,11 @@ namespace faith
 				volume = GetConfig().soundVolume;
 				faith_sound_volume(faith, volume);
 			}
+			static int stepUp = -1;
+			if (faith && stepUp != static_cast<int>(GetConfig().autoStepUp)) {
+				stepUp = GetConfig().autoStepUp;
+				faith_set_auto_step_up(faith, static_cast<std::uint8_t>(stepUp));
+			}
 			const bool quiet = !active || MenuOpen() || SkyrimBusy(a_player);
 			if (faith) {
 				faith_sound_pause(faith, quiet);
@@ -1110,6 +1131,7 @@ namespace faith
 			faith_step(faith, a_delta, &input, &frame);
 			timer.Mark("Faith's step");
 			haveFrame = true;
+			ReactionTime();
 			ApplyHits(a_player);
 			ApplyTakedowns(a_player, a_delta);
 			HoldOnCourse(a_player);
@@ -1342,6 +1364,24 @@ namespace faith
 			}
 		}
 
+		// TdMove_Vertigo's zoom (StartZoom to 84 of the game's 90, UnZoom back): Skyrim's field of
+		// view narrowed by as much while it lasts, then put back.
+		float savedWorldFov = -1.0f;
+		void ApplyZoom(RE::PlayerCamera* a_camera)
+		{
+			auto&       data = a_camera->GetRuntimeData2();
+			const float zoom = haveFrame ? frame.fov_deg - 90.0f : 0.0f;
+			if (active && zoom < -0.01f) {
+				if (savedWorldFov < 0.0f) {
+					savedWorldFov = data.worldFOV;
+				}
+				data.worldFOV = savedWorldFov + zoom;
+			} else if (savedWorldFov >= 0.0f) {
+				data.worldFOV = savedWorldFov;
+				savedWorldFov = -1.0f;
+			}
+		}
+
 		// Right before Skyrim draws the world: did anything change our pose or camera since we
 		// set them? Then set them once more, as the last word.
 		void BeforeRender()
@@ -1349,6 +1389,7 @@ namespace faith
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			auto* camera = RE::PlayerCamera::GetSingleton();
 			if (player && camera) {
+				ApplyZoom(camera);
 				MatchFirstPersonFov(player, camera);  // also puts Skyrim's back once Faith is off
 				// Skyrim fades the player out when its third-person camera comes close: not when
 				// that camera is Faith's eyes.

@@ -1374,3 +1374,370 @@ fn takedowns_reach_close_and_follow_their_facing() {
     assert_eq!(at(1.5, Vec3::new(1.0, 0.0, -0.2)), Some(3), "sideways, a little away: from behind");
     assert!(at(1.5, Vec3::new(1.0, 0.0, 0.2)).is_some_and(|a| a < 3), "sideways, a little towards her: from the front");
 }
+
+/// Up a flight of 25 cm steps: her feet jump each step, but her mesh (and the camera on it)
+/// eases up after them (ATdPawn's mesh smoothing), never more than 24 uu behind; on the flat
+/// at the top it catches up.
+#[test]
+fn stairs_ease_the_mesh_up() {
+    let mut w = floor();
+    for i in 0..8 {
+        let z0 = -1.0 - i as f32 * 0.3;
+        w.add(Aabb::new(Vec3::new(-2.0, 0.0, -20.0), Vec3::new(2.0, 0.25 * (i + 1) as f32, z0)));
+    }
+    let mut c = ctrl_at(Vec3::ZERO);
+    let mut prev_view = c.feet.y + c.mesh_offset;
+    let (mut biggest_feet, mut biggest_view, mut most_held) = (0.0f32, 0.0f32, 0.0f32);
+    let mut prev_feet = c.feet.y;
+    run(&mut c, &w, 3.0, |_, c| {
+        let view = c.feet.y + c.mesh_offset;
+        biggest_feet = biggest_feet.max(c.feet.y - prev_feet);
+        biggest_view = biggest_view.max(view - prev_view);
+        most_held = most_held.max(c.mesh_offset.abs());
+        prev_feet = c.feet.y;
+        prev_view = view;
+        Input { move_axis: Vec2::new(0.0, 0.5), ..Default::default() }
+    });
+    assert!(c.feet.y > 1.9, "climbed to {}", c.feet.y);
+    assert!(biggest_feet > 0.2, "the feet step ({biggest_feet})");
+    assert!(biggest_view < biggest_feet * 0.6, "the view eases: {biggest_view} a frame against the feet's {biggest_feet}");
+    assert!(most_held <= 0.24 + 1e-4, "held back at most 24 uu: {most_held}");
+    run(&mut c, &w, 1.0, |_, _| Input::default());
+    assert!(c.mesh_offset.abs() < 1e-4, "caught up: {}", c.mesh_offset);
+}
+
+/// A 42 cm step: as shipped (auto step-up off) she stops against it; with TdMove_AutoStepUp on
+/// she steps up onto it and walks on. A 25 cm one the walk climbs by itself, no step-up.
+#[test]
+fn auto_step_up_onto_a_knee_high_step() {
+    let walk_at = |rise: f32, on: bool| {
+        let mut w = floor();
+        w.add(Aabb::new(Vec3::new(-2.0, 0.0, -10.0), Vec3::new(2.0, rise, -1.0)));
+        let mut c = ctrl_at(Vec3::ZERO);
+        c.tuning.auto_step_up = on;
+        let ev = run(&mut c, &w, 2.0, |_, _| Input { move_axis: Vec2::new(0.0, 0.5), ..Default::default() });
+        (c.feet, ev.contains(&Event::StepUp))
+    };
+    let (feet, stepped) = walk_at(0.42, false);
+    assert!(feet.y < 0.05 && !stepped, "shipped: stopped at the step, {feet}");
+    let (feet, stepped) = walk_at(0.42, true);
+    assert!(stepped && (feet.y - 0.42).abs() < 0.03 && feet.z < -1.5, "stepped up and on: {feet}");
+    let (feet, stepped) = walk_at(0.25, true);
+    assert!(!stepped && (feet.y - 0.25).abs() < 0.03, "walked up a low one: {feet}");
+}
+
+/// A slope too steep to stand on (49 degrees: normal 0.66) slides her down it on her backside
+/// (TdMove_RumpSlide) to the flat at the bottom; a 30 degree one she just walks down.
+#[test]
+fn rump_slide_down_a_steep_slope() {
+    let slide = |deg: f32| {
+        let rise = 6.0;
+        let run = rise / deg.to_radians().tan();
+        // Top at z = 0 (height 6), down to z = -run (height 0), flat beyond.
+        let mut tris = vec![];
+        tris.extend(MeshWorld::quad(
+            Vec3::new(-3.0, rise, 0.0),
+            Vec3::new(3.0, rise, 0.0),
+            Vec3::new(3.0, 0.0, -run),
+            Vec3::new(-3.0, 0.0, -run),
+        ));
+        tris.extend(MeshWorld::quad(Vec3::new(-3.0, rise, 4.0), Vec3::new(3.0, rise, 4.0), Vec3::new(3.0, rise, 0.0), Vec3::new(-3.0, rise, 0.0)));
+        tris.extend(MeshWorld::quad(Vec3::new(-3.0, 0.0, -run), Vec3::new(3.0, 0.0, -run), Vec3::new(3.0, 0.0, -run - 20.0), Vec3::new(-3.0, 0.0, -run - 20.0)));
+        let w = MeshWorld::new(tris, vec![]);
+        let mut c = Controller::new(Tuning::default(), Vec3::new(0.0, rise, 1.0), 0.0);
+        c.state = State::Air;
+        let mut ev = vec![];
+        let mut slid = false;
+        for _ in 0..(6 * 60) {
+            c.step(1.0 / 60.0, &Input { move_axis: Vec2::new(0.0, 0.3), ..Default::default() }, &w);
+            ev.extend(c.events.iter().copied());
+            slid |= matches!(c.state, State::RumpSlide { .. });
+        }
+        (c.feet, slid, ev.contains(&Event::RumpSlide))
+    };
+    let (feet, slid, event) = slide(49.0);
+    assert!(slid && event, "slid down the steep one");
+    assert!(feet.y < 0.2, "reached the bottom: {feet}");
+    let (_, slid, _) = slide(30.0);
+    assert!(!slid, "walked down the 30 degree one");
+}
+
+/// Hanging from a window sill, jump while pushing up: with the next ledge 1.2 m above on the
+/// same wall, she reaches up to it (TdMove_GrabTransfer) and hangs there; without one she pulls
+/// up as before.
+#[test]
+fn grab_transfer_up_to_the_ledge_above() {
+    let hang_then_jump = |upper: bool| {
+        let mut w = floor();
+        // A wall to 2 m (face at z = 0, she's on the +z side), a window from 2 to 2.6 m.
+        w.add(Aabb::new(Vec3::new(-3.0, 0.0, -1.0), Vec3::new(3.0, 2.0, 0.0)));
+        w.add(Aabb::new(Vec3::new(-3.0, 2.0, -1.0), Vec3::new(3.0, 2.6, -0.8)));
+        if upper {
+            w.add(Aabb::new(Vec3::new(-3.0, 2.6, -1.0), Vec3::new(3.0, 3.2, 0.0)));
+        }
+        let mut c = ctrl_at(Vec3::ZERO);
+        let hands = c.tuning.hang_hands_above_feet;
+        c.feet = Vec3::new(0.0, 2.0 - hands, c.tuning.half_width + 0.02);
+        c.state = State::LedgeHang { normal: Vec3::Z, ledge_y: 2.0, turned: false };
+        c.yaw = 0.0;
+        run(&mut c, &w, 1.0, |_, _| Input::default());
+        let ev = run(&mut c, &w, 1.5, |t, _| Input { jump_pressed: t < 0.02, move_axis: Vec2::new(0.0, if t < 0.1 { 1.0 } else { 0.0 }), ..Default::default() });
+        (c.state, ev)
+    };
+    let (state, ev) = hang_then_jump(true);
+    assert!(ev.contains(&Event::GrabTransfer), "{ev:?}");
+    assert!(matches!(state, State::LedgeHang { ledge_y, .. } if (ledge_y - 3.2).abs() < 0.05), "hangs from the upper ledge: {state:?}");
+    let (_, ev) = hang_then_jump(false);
+    assert!(!ev.contains(&Event::GrabTransfer) && ev.contains(&Event::PullUp), "no ledge above: pulls up: {ev:?}");
+}
+
+/// TdMove_MeleeVault: attack pressed mid-vault turns the way down into a kick, 0.3 s in, that
+/// lands on someone standing past the rail.
+#[test]
+fn vault_kick_over_a_rail() {
+    let mut w = floor();
+    w.add(Aabb::new(Vec3::new(-5.0, 0.0, -5.2), Vec3::new(5.0, 1.0, -5.0)));
+    let mut c = ctrl_at(Vec3::ZERO);
+    c.targets = vec![Target { id: 7, centre: Vec3::new(0.0, 0.9, -7.7), radius: 0.3, half_height: 0.9, eye: 0.6, facing: Vec3::Z }];
+    let mut pressed = false;
+    let ev = run(&mut c, &w, 2.5, |_, c| {
+        let melee = !pressed && matches!(c.state, State::Vault(_));
+        pressed |= melee;
+        Input { jump_pressed: c.feet.z < -4.2 && c.feet.z > -4.9, melee_pressed: melee, ..fwd() }
+    });
+    assert!(has(&ev, Event::Vault), "events {ev:?}");
+    assert!(ev.iter().any(|e| matches!(e, Event::Melee { kind: MeleeKind::VaultKick, .. })), "events {ev:?}");
+    assert!(ev.iter().any(|e| matches!(e, Event::MeleeHit { target: 7, kind: MeleeKind::VaultKick, .. })), "events {ev:?}");
+    assert!(c.feet.z < -5.4, "past the rail: {}", c.feet.z);
+}
+
+/// TdMove_AirBarge: attack in a jump at a door and she goes through it shoulder first,
+/// then lands and walks on.
+#[test]
+fn air_barge_through_a_door() {
+    let w = door_world();
+    let mut c = ctrl_at(Vec3::new(0.0, 0.0, -2.0));
+    let mut jumped = false;
+    let mut swung = false;
+    let ev = run(&mut c, &w, 3.0, |_, c| {
+        let jump = !jumped && c.feet.z < -3.4;
+        jumped |= jump;
+        let melee = jumped && !swung && c.state == State::Air;
+        swung |= melee;
+        Input { jump_pressed: jump, melee_pressed: melee, ..fwd() }
+    });
+    assert!(has(&ev, Event::AirBarge), "{ev:?}");
+    assert!(has(&ev, Event::DoorOpened { door: 0 }) && has(&ev, Event::AirBargeImpact), "{ev:?}");
+    assert!(has(&ev, Event::AirBargeLand), "{ev:?}");
+    assert!(c.feet.z < -6.5 && c.state == State::Ground, "through: {:?} {:?}", c.feet, c.state);
+}
+
+/// A rooftop 3 m across with nothing under its edge.
+fn rooftop() -> BoxWorld {
+    let mut w = BoxWorld::default();
+    w.add(Aabb::new(Vec3::new(-5.0, -1.0, -3.0), Vec3::new(5.0, 0.0, 5.0)));
+    w
+}
+
+/// TdMove_Vertigo: walking up to a long drop she stops at the edge and looks down over it;
+/// stepping back afterwards hands back to walking.
+#[test]
+fn vertigo_at_a_rooftop_edge() {
+    let w = rooftop();
+    let mut c = ctrl_at(Vec3::ZERO);
+    let walk = Input { move_axis: Vec2::new(0.0, 0.4), ..Default::default() };
+    let ev = run(&mut c, &w, 3.0, |_, _| walk);
+    assert!(has(&ev, Event::Vertigo), "{ev:?}");
+    assert!(matches!(c.state, State::Vertigo { .. }), "still looking over while pushing on: {:?}", c.state);
+    assert!(c.feet.z > -3.0 && c.feet.y.abs() < 1e-3, "at the edge: {:?}", c.feet);
+    assert!(c.pitch < -1.2, "looking down: {}", c.pitch);
+    assert!(c.vertigo_zoom || c.state != State::Ground);
+    run(&mut c, &w, 0.5, |_, _| Input { move_axis: Vec2::new(0.0, -1.0), ..Default::default() });
+    assert_eq!(c.state, State::Ground);
+    assert!(!c.vertigo_zoom);
+}
+
+/// Running (WAS_Run and up), she goes straight off.
+#[test]
+fn no_vertigo_at_a_run() {
+    let w = rooftop();
+    let mut c = ctrl_at(Vec3::ZERO);
+    let ev = run(&mut c, &w, 2.5, |_, _| fwd());
+    assert!(!has(&ev, Event::Vertigo), "{ev:?}");
+    assert!(c.feet.y < -1.0, "off the edge: {:?}", c.feet);
+}
+
+/// TdMove_SwingJump: jumping off a swing bar with another one ahead carries her across to it,
+/// and she swings on from that one.
+#[test]
+fn swing_to_swing() {
+    let mut w = BoxWorld::default();
+    w.add(Aabb::new(Vec3::new(-20.0, -11.0, -20.0), Vec3::new(20.0, -10.0, 20.0)));
+    w.fixtures.push(Fixture::SwingPole { a: Vec3::new(-2.0, 3.0, 0.0), b: Vec3::new(2.0, 3.0, 0.0) });
+    w.fixtures.push(Fixture::SwingPole { a: Vec3::new(-2.0, 3.0, -3.5), b: Vec3::new(2.0, 3.0, -3.5) });
+    let mut c = ctrl_at(Vec3::new(0.0, 0.95, 0.3));
+    c.state = State::Air;
+    c.vel = Vec3::new(0.0, 0.0, -4.0);
+    let mut jumped = false;
+    let mut second = None;
+    let ev = run(&mut c, &w, 4.0, |_, c| {
+        if let State::Swing { at, .. } = c.state {
+            if at.z < -3.0 {
+                second.get_or_insert(at);
+            }
+        }
+        let jump = !jumped && matches!(c.state, State::Swing { rate, at, .. } if rate > 3.0 && at.z > -1.0);
+        jumped |= jump;
+        Input { jump_pressed: jump, move_axis: Vec2::new(0.0, if jumped { 0.0 } else { 1.0 }), ..Default::default() }
+    });
+    assert!(has(&ev, Event::SwingToSwing), "{ev:?}");
+    assert!(second.is_some(), "caught the second bar: {ev:?} {:?}", c.feet);
+}
+
+/// A wall 4 m high at z = -6 with a ladder (or drainpipe) up it.
+fn ladder_wall(pipe: bool) -> BoxWorld {
+    let mut w = floor();
+    w.add(Aabb::new(Vec3::new(-5.0, 0.0, -9.0), Vec3::new(5.0, 4.0, -6.0)));
+    w.fixtures.push(Fixture::Ladder(Ladder { base: Vec3::new(0.0, 0.0, -6.0), top: 4.0, normal: Vec3::Z, pipe }));
+    w
+}
+
+/// TdMove_IntoClimb / TdMove_Climb: walk up to a ladder holding forward, climb it step by step
+/// and over the top onto the roof.
+#[test]
+fn climb_a_ladder_onto_the_roof() {
+    for pipe in [false, true] {
+        let w = ladder_wall(pipe);
+        let mut c = ctrl_at(Vec3::new(0.0, 0.0, -3.0));
+        let ev = run(&mut c, &w, 9.0, |_, c| if c.feet.y > 3.9 && c.state == State::Ground { Input::default() } else { fwd() });
+        assert!(ev.iter().any(|e| matches!(e, Event::ClimbStart { .. })) || ev.iter().any(|e| matches!(e, Event::ClimbStep)), "pipe {pipe}: {ev:?}");
+        assert!(has(&ev, Event::ClimbExit), "pipe {pipe}: {ev:?} {:?} {:?}", c.feet, c.state);
+        assert!((c.feet.y - 4.0).abs() < 0.05 && c.feet.z < -6.0 && c.state == State::Ground, "pipe {pipe}: on the roof: {:?} {:?}", c.feet, c.state);
+    }
+}
+
+/// Down again: pushing back climbs down, and at the bottom with the floor under her she's off.
+#[test]
+fn climb_down_a_ladder_and_off() {
+    let w = ladder_wall(false);
+    let mut c = ctrl_at(Vec3::new(0.0, 0.0, -3.0));
+    run(&mut c, &w, 2.0, |_, c| if matches!(c.state, State::Climb { step, .. } if step >= 3) { Input::default() } else { fwd() });
+    assert!(matches!(c.state, State::Climb { .. }), "{:?}", c.state);
+    let ev = run(&mut c, &w, 4.0, |_, c| if matches!(c.state, State::Climb { .. }) { Input { move_axis: Vec2::new(0.0, -0.5), ..Default::default() } } else { Input::default() });
+    assert!(has(&ev, Event::ClimbLetGo), "{ev:?}");
+    assert_eq!(c.state, State::Ground);
+    assert!(c.feet.y.abs() < 0.05, "{:?}", c.feet);
+}
+
+/// Over the top of a ladder from the roof, facing out: LadderEnterTop onto it.
+#[test]
+fn onto_a_ladder_from_the_top() {
+    let w = ladder_wall(false);
+    let mut c = ctrl_at(Vec3::new(0.0, 4.0, -7.5));
+    c.yaw = std::f32::consts::PI; // facing +Z, out over the edge
+    let ev = run(&mut c, &w, 3.0, |_, c| if matches!(c.state, State::Climb { .. }) { Input::default() } else { fwd() });
+    assert!(ev.iter().any(|e| matches!(e, Event::ClimbStart { start: ClimbStart::EnterTop, .. })), "{ev:?} {:?}", c.state);
+    assert!(matches!(c.state, State::Climb { .. }), "{:?} {:?}", c.state, c.feet);
+}
+
+/// The training course's pair of swing bars: jump up to the first, swing, and across to the next.
+#[test]
+fn training_swing_bars_carry_across() {
+    use crate::greybox::{self, ROOF_D_Y};
+    let w = greybox::greybox().world();
+    let mut c = ctrl_at(Vec3::new(12.2, ROOF_D_Y, -109.0));
+    let mut caught = false;
+    let mut jumped = false;
+    let mut took_off = false;
+    let ev = run(&mut c, &w, 6.0, |_, c| {
+        let on_first = matches!(c.state, State::Swing { at, .. } if at.z > -116.0);
+        caught |= on_first;
+        let off = !took_off && c.feet.z < -113.4;
+        took_off |= off;
+        let jump = off || (!jumped && matches!(c.state, State::Swing { rate, at, .. } if rate > 3.0 && at.z > -116.0));
+        jumped |= jump && caught;
+        Input { jump_pressed: jump, move_axis: Vec2::new(0.0, if jumped { 0.0 } else { 1.0 }), ..Default::default() }
+    });
+    assert!(caught, "caught the first bar: {ev:?}");
+    assert!(has(&ev, Event::SwingToSwing), "{ev:?}");
+    assert!(matches!(c.state, State::Swing { at, .. } if at.z < -118.0) || ev.iter().filter(|e| **e == Event::SwingStart).count() >= 2, "{ev:?} {:?}", c.state);
+}
+
+/// The training course's ladder and drainpipe up to the top roof: climbed from roof B2 onto C.
+#[test]
+fn training_ladder_and_pipe_reach_the_top_roof() {
+    use crate::greybox::{self, z, ROOF_B_Y, ROOF_C_Y};
+    let w = greybox::greybox().world();
+    for x in [4.2, -4.2] {
+        let mut c = ctrl_at(Vec3::new(x, ROOF_B_Y, z::CLIMB_WALL + 3.0));
+        let ev = run(&mut c, &w, 10.0, |_, c| if c.feet.y > ROOF_C_Y - 0.1 && c.state == State::Ground { Input::default() } else { fwd() });
+        assert!(has(&ev, Event::ClimbExit), "x {x}: {ev:?} {:?} {:?}", c.feet, c.state);
+        assert!((c.feet.y - ROOF_C_Y).abs() < 0.05 && c.state == State::Ground, "x {x}: {:?} {:?}", c.feet, c.state);
+    }
+}
+
+/// Stone city stairs: 34.3 cm risers, 48 cm treads. Under ME's
+/// 35 cm MaxStepHeight, so the walk climbs them by itself, walking and running.
+#[test]
+fn walks_up_city_stairs() {
+    for push in [0.4, 1.0] {
+        let mut w = floor();
+        for i in 0..6 {
+            let z0 = -2.0 - i as f32 * 0.48;
+            w.add(Aabb::new(Vec3::new(-2.0, 0.0, -20.0), Vec3::new(2.0, 0.343 * (i + 1) as f32, z0)));
+        }
+        let mut c = ctrl_at(Vec3::ZERO);
+        let mut top: f32 = 0.0;
+        run(&mut c, &w, 4.0, |_, c| {
+            top = top.max(c.feet.y);
+            Input { move_axis: Vec2::new(0.0, push), ..Default::default() }
+        });
+        assert!(top > 0.343 * 6.0 - 0.01, "push {push}: got to {top}");
+    }
+}
+
+/// The same stairs as triangles (what a game engine's static collision is).
+#[test]
+fn walks_up_city_stairs_as_triangles() {
+    for rise in [0.30f32, 0.343, 0.347] {
+        let mut tris = MeshWorld::oriented_box(Vec3::new(0.0, -0.5, 0.0), Vec3::new(20.0, 0.5, 20.0), 0.0);
+        for i in 0..6 {
+            let h = rise * (i + 1) as f32;
+            let z0 = -2.0 - i as f32 * 0.48;
+            tris.extend(MeshWorld::oriented_box(Vec3::new(0.0, h * 0.5, (z0 - 10.0) * 0.5), Vec3::new(2.0, h * 0.5, (10.0 + z0) * 0.5), 0.0));
+        }
+        let w = MeshWorld::new(tris, vec![]);
+        let mut c = ctrl_at(Vec3::ZERO);
+        let mut top: f32 = 0.0;
+        for push in [0.4f32, 1.0] {
+            c = ctrl_at(Vec3::ZERO);
+            for _ in 0..240 {
+                c.step(DT, &Input { move_axis: Vec2::new(0.0, push), ..Default::default() }, &w);
+                top = top.max(c.feet.y);
+                // Stairs aren't a slope to slide down.
+                assert!(!matches!(c.state, State::RumpSlide { .. }), "rise {rise} push {push}: rump slide at {:?}", c.feet);
+            }
+        }
+        assert!(top > rise * 6.0 - 0.01, "rise {rise}: got to {top}, {:?}", c.feet);
+    }
+}
+
+/// Stairs whose collision is only their tops (some games' stairs are): the edge of the next top is met
+/// side on, and the walk steps up onto it instead of walking into the step.
+#[test]
+fn walks_up_stairs_with_only_tops() {
+    let mut tris = MeshWorld::oriented_box(Vec3::new(0.0, -0.5, 0.0), Vec3::new(20.0, 0.5, 20.0), 0.0);
+    for i in 0..6 {
+        let y = 0.343 * (i + 1) as f32;
+        let (z0, z1) = (-2.0 - i as f32 * 0.48, -2.0 - (i + 1) as f32 * 0.48);
+        tris.extend(MeshWorld::quad(Vec3::new(-2.0, y, z0), Vec3::new(2.0, y, z0), Vec3::new(2.0, y, z1), Vec3::new(-2.0, y, z1)));
+    }
+    let w = MeshWorld::new(tris, vec![]);
+    let mut c = ctrl_at(Vec3::ZERO);
+    let mut top: f32 = 0.0;
+    for _ in 0..300 {
+        c.step(DT, &Input { move_axis: Vec2::new(0.0, 0.4), ..Default::default() }, &w);
+        top = top.max(c.feet.y);
+    }
+    assert!(top > 0.343 * 6.0 - 0.01, "got to {top}, {:?}", c.feet);
+}

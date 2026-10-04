@@ -1,7 +1,7 @@
 # Faith Runner for Skyrim
 
 An SKSE plugin that puts Mirror's Edge's movement, animation and camera on Skyrim's player:
-- **The movement** is [Faith Runner](https://github.com/tnrjns/faith-runner)'s `faith_move`, running on Skyrim's own collision. That covers wallruns, wallclimbs, vaults, ledge grabs, slides, rolls, 180s, dodges and springboards.
+- **The movement** is [Faith Runner](https://github.com/tnrjns/faith-runner)'s `faith_move`, running on Skyrim's own collision. That covers wallruns, wallclimbs, vaults, ledge grabs and grab transfers, slides, rump slides down steep ground, rolls, 180s, dodges, springboards, vertigo at long drops, ladders and drainpipes, swing-to-swing jumps, the vault kick, the air barge, takedowns and Reaction Time.
 - **The animation** is Faith's own, read from your Mirror's Edge install, on the player's first-person arms and third-person body.
 - **The camera** in first person is hers: the camera bone, bob, rolls, the swan neck and Mirror's Edge's speed blur.
 - **The training courses** from the app are playable too, built in the sky above you.
@@ -65,6 +65,7 @@ There's **no ESP**. If an old save complains that `FaithParkour.esp` is missing 
 | Q | 180 turn (on a wall: climb, Q, Space to kick off) |
 | Left mouse / F | Attack (punch, jump kick, slide kick, wallrun kick, crouch attack), barge, kick doors |
 | **V** | Takedown: Mirror's Edge's disarm on someone within about 3 m in front of you, from the front or from behind by which way they face |
+| **X** | Reaction Time: once running has filled its meter ("Reaction Time ready"), the whole game slows to a quarter for about 8 s |
 | **Caps Lock** | Walk (toggle), like Skyrim's always-run |
 | F7 | First-person view: Faith's own body ↔ Skyrim's whole body |
 | G | Play one of Faith's idles. She also plays them by herself after 30-40 s standing still. |
@@ -72,7 +73,7 @@ There's **no ESP**. If an old save complains that `FaithParkour.esp` is missing 
 | F10 | Survey the collision around you, for the parkour tool |
 | F1 | SKSE Menu Framework's Mod Control Panel (its own key) |
 
-**Gamepad**, as Mirror's Edge's layout: LB jump, LT crouch, Y 180 turn, X or RT attack, right stick click takedown, Back to the checkpoint on a course; the sticks move and look.
+**Gamepad**, as Mirror's Edge's layout: LB jump, LT crouch, Y 180 turn, X or RT attack, right stick click takedown, left stick click Reaction Time, Back to the checkpoint on a course; the sticks move and look. On a ladder, the left stick right down slides her down it.
 
 Everything else stays Skyrim's: E to activate, menus, favourites, shouts and waiting. In menus, dialogue, furniture, on horseback and in kill moves, Skyrim keeps the player until it lets go.
 
@@ -120,7 +121,8 @@ Each setting is commented in the file itself.
 | `fNearDistanceBody` | `10.0` | The same, in the whole-body view. |
 | `fSoundVolume` | `0.8` | Faith's sounds: footsteps, breathing, landings, wind. 0 is off. |
 | `iSurveyKey` | `0x44` (F10) | Saves the collision around you for the parkour tool. |
-| `bWorldFixtures` | `1` | Skyrim's own cables, high bars and planks over drops work as ziplines, swing poles and balance beams. |
+| `bWorldFixtures` | `1` | Skyrim's own cables, high bars, planks over drops and pipes up walls work as ziplines, swing poles, balance beams and drainpipes. |
+| `bAutoStepUp` | `1` | Mirror's Edge's auto step-up (in the game's code but switched off there): walking into a step of 35-48 cm she steps up onto it instead of stopping. Skyrim's city steps are mostly 34 cm, which the walk climbs by itself; some are 43-50 cm. Measured on Riften's and Solitude's stairs with `parkour_tool`'s `steps`, she walks up about two thirds of the flights straight on; the rest are curved or angled flights where she slides along a riser, so jump or vault those. |
 | `bStamina` | `0` | Sprinting, wallruns and wallclimbs drain Skyrim's stamina; with none left she can't sprint. Mirror's Edge has no stamina, so 0 is the game's own way. |
 | `bHeldInGrip` | `1` | In Faith's own body view, what Skyrim's hands hold (weapons, shields, spells) shows in her grip. |
 | `fHeldRange` | `60` | ...anything Skyrim drew within this many units of the camera goes in front of her arms. |
@@ -149,6 +151,7 @@ Each setting is commented in the file itself.
 | `fMeleeDamageMult` | `1.0` | x Mirror's Edge's damage, taken as Skyrim health: punch 33.5, air kick 60-100, slide kick 60, wallrun kick 80. |
 | `iTakedownKey` | `0x2F` (V) | Mirror's Edge's disarm on whoever's close in front of her. She takes their weapon (into your inventory); humanoids play the game's own victim animation (the patrol cop's, retargeted onto them). |
 | `bTakedownKills` | `true` | At the end they go down (essential characters only to their knees). 0: they're staggered and fight on. |
+| `iReactionTimeKey` | `0x2D` (X) | Mirror's Edge's Reaction Time. The meter fills as she runs (0.005 x her speed a second, from 99.9 at the start); full, the key slows the game (Skyrim's time multiplier) down to 0.25 over its first tenth, holds, and eases back over its last fifth, 8 real seconds in all. |
 
 ### Troubleshooting
 
@@ -169,7 +172,7 @@ These are the app's maps, playable in Skyrim. Open **Mod Control Panel → Faith
 | **Moves** | Springboard, balance beam, swing pole, zipline, a door to barge, barbed wire, a mattress to drop onto, and the finish. |
 | **Rooftops** | The app's rooftop run. |
 | **Springboard** | Springboard lanes. |
-| **Training** | Every move, in order. |
+| **Training** | Every move, in order, plus a ladder and a drainpipe either side of the wall to the third roof and two swing bars next to the last roof's stairs. |
 
 How a course plays:
 - **Where it is:** built `fHeight` units above you. While you're on it, it's Faith's whole world, and Skyrim's collision is set aside.
@@ -261,7 +264,8 @@ cargo test --release -p faith_ffi -p faith_anim -p faith_move
 ## Not there yet
 
 - **Moving objects:** they collide as they were when last read.
-- **Fixtures in the world:** ziplines, swing poles and balance beams need markers, and Skyrim has none. They exist on the training courses.
+- **Fixtures in the world:** Mirror's Edge marks its ziplines, swing poles, balance beams and ladders; Skyrim has no such markers, so they're guessed from the shape of its collision (thin cables, bars, planks and upright pipes). Ladders aren't (Skyrim's are scenery), but the training courses have them.
+- **Vertigo:** the game's test for "this step would take her off the edge" isn't decoded; she stops when there's no floor 20 cm past her edge.
 - **Takedowns:** creatures (non-humanoid skeletons) are held and go down but don't play the victim animation; the cop's voice lines don't load.
 - **People on a course** stand on it, but bodies fall through it (only Faith collides with it).
 

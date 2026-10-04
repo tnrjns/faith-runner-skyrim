@@ -68,6 +68,13 @@ impl Rig {
         // Some(Some(y)): body locked facing y; Some(None): locked, hold; None: follows the view.
         let lock: Option<Option<f32>> = match c.state {
             MoveState::Slide { .. } | MoveState::WallRun { .. } => Some(yaw_of(c.vel)),
+            // TdMove_RumpSlide.bDisableFaceRotation: facing down the slope.
+            MoveState::RumpSlide { face, .. } => Some(Some(face)),
+            MoveState::GrabTransfer { normal, .. } => Some(yaw_of(-normal)),
+            // TdMove_Climb.bDisableFaceRotation: facing the ladder; over the top from the roof,
+            // facing out until LadderEnterTop turns her round.
+            MoveState::IntoClimb { ladder, start: faith_move::ClimbStart::EnterTop, .. } => Some(yaw_of(ladder.normal)),
+            MoveState::IntoClimb { ladder, .. } | MoveState::Climb { ladder, .. } | MoveState::ClimbExit { ladder, .. } => Some(yaw_of(-ladder.normal)),
             MoveState::ZipLine { a, b, .. } => Some(yaw_of(b - a)),
             MoveState::Swing { dir, .. } => Some(yaw_of(dir)),
             MoveState::Balance { a, b, .. } => {
@@ -76,7 +83,7 @@ impl Rig {
                 Some(yaw_of(u))
             }
             // TdMove_LayOnGround.bDisableFaceRotation: lying there, looking round doesn't turn you.
-            MoveState::Traverse(_) | MoveState::Vault(_) | MoveState::LayOnGround { .. } | MoveState::Barge { .. } | MoveState::Stumble { .. } | MoveState::SoftLand { .. } => Some(None),
+            MoveState::Traverse(_) | MoveState::Vault(_) | MoveState::LayOnGround { .. } | MoveState::Barge { .. } | MoveState::AirBarge { .. } | MoveState::Stumble { .. } | MoveState::SoftLand { .. } => Some(None),
             // TdMove_Grab.bDisableFaceRotation: hanging, the body keeps facing the wall and only
             // the view turns (looking right round plays the hang-turn reach instead).
             MoveState::LedgeHang { normal, .. } if c.shimmy.is_none_or(|sh| sh.corner.is_none()) => Some(yaw_of(-normal)),
@@ -124,7 +131,9 @@ impl Rig {
         let feet = c.root();
         let gameplay_eye = c.view().eye;
         let aligned = gameplay_eye - body_rot * cam_local;
-        let mut origin = feet.lerp(aligned, body.align);
+        // After a step up or down the mesh (and her camera on it) eases to her feet
+        // (Controller::mesh_offset).
+        let mut origin = feet.lerp(aligned, body.align) + Vec3::Y * c.mesh_offset;
         if let Some((bar, _)) = swing {
             let hand = |n: &str| arms.bone(n).map(|b| to_view(self.driver.globals[b].w_axis.truncate()));
             // The bar runs through the palms, at the fingers' roots.
@@ -219,6 +228,24 @@ impl Rig {
         len("MeleeInAirHit", 1.0, &mut c.air_hit);
         len("MeleeSlide", 1.0, &mut c.slide);
         len("MeleeWallRunLeft", 1.0, &mut c.wallrun);
+        len("MeleeVaultOver", 1.0, &mut c.vault_kick);
+        // The ladder clips' root motion (root space: -Y up, Z forward, uu).
+        let root = |seq: &str| {
+            self.driver
+                .root_pos_curve(arms, seq)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| Vec3::new(p.x, -p.y, p.z) / 100.0)
+                .collect::<Vec<_>>()
+        };
+        t.climb_curves = Some(std::sync::Arc::new(faith_move::climb::ClimbCurves {
+            exit_ladder: [root("LadderExitTopLeftHand"), root("LadderExitTopRightHand")],
+            exit_pipe: [root("pipeexittoplefthand"), root("pipeexittoprighthand")],
+            enter_top: root("LadderEnterTop"),
+        }));
+        for (i, seq) in ["AirBargeIdle", "AirBargeImpact", "AirBargeLand"].iter().enumerate() {
+            len(seq, 1.0, &mut t.air_barge_clips[i]);
+        }
         // A takedown lasts its clip (TdMOVE_Disarm.OnCustomAnimEnd).
         for (i, seq) in faith_move::TAKEDOWN_ANIMS.iter().enumerate() {
             if let Some(l) = Driver::length(arms, seq) {

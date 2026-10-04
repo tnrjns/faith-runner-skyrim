@@ -95,6 +95,9 @@ namespace faith::Menu
 
 			ImGuiMCP::SeparatorText("The world");
 			Changed(ImGuiMCP::Checkbox("Ziplines, swing poles and beams in Skyrim", &c.worldFixtures));
+			Changed(ImGuiMCP::Checkbox("Step up onto knee-high steps", &c.autoStepUp));
+			Tooltip("Mirror's Edge's own auto step-up (written into the game but switched off there): walking into a step up to about half a metre, "
+					"she steps up onto it instead of stopping. Skyrim's stone steps are often taller than she walks up by herself.");
 			Tooltip("Skyrim's own cables, high bars and planks over drops work as Mirror's Edge's: found in the collision around you.");
 
 			Changed(ImGuiMCP::Checkbox("Use Skyrim's stamina", &c.stamina));
@@ -235,6 +238,7 @@ namespace faith::Menu
 			KeyPicker("First-person view", c.viewmodelKey);
 			KeyPicker("Play an idle", c.idleKey);
 			KeyPicker("Takedown", c.takedownKey);
+			KeyPicker("Reaction Time", c.reactionKey);
 			Tooltip("Mirror's Edge's disarm on whoever's close in front of her: from behind, or a snatch from the front.");
 			KeyPicker("Walk (toggle)", c.walkKey);
 			KeyPicker("Back to the checkpoint (on a course)", c.respawnKey);

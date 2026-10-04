@@ -7,7 +7,7 @@ SRC = r'C:\Users\myste\Downloads\faith-runner\faith-runner'
 DST = r'C:\Users\myste\Downloads\faith-runner\faith-runner-skyrim'
 
 # Never copied: builds, logs, local tools, the prologue map's code, the unused ESP tool.
-SKIP_DIRS = {'target', 'build', '.tools', 'ParkourEsp', 'CommonLibSSE-NG', '.git', 'bin', 'obj'}
+SKIP_DIRS = {'target', 'build', '.tools', 'ParkourEsp', 'CommonLibSSE-NG', '.git'}
 SKIP_FILES = {
     # me_assets: the prologue map (not public)
     'level.rs', 'collision.rs', 'staticmesh.rs', 'postfx.rs', 'material.rs', 'level_tests.rs',

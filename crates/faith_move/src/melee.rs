@@ -37,6 +37,9 @@ const fn uu(v: f32) -> f32 {
     v / 100.0
 }
 
+/// TdMove_MeleeVault.StartMove: SetTimer(0.3) to the kick.
+const VAULT_KICK_AT: f32 = 0.3;
+
 /// Per move: TargetingMaxDistance, TraceExtent, TraceOffset, MeleeDamage (the class defaults).
 pub(crate) struct MeleeClass {
     pub targeting: f32,
@@ -55,6 +58,8 @@ pub(crate) fn class(kind: MeleeKind) -> MeleeClass {
         MeleeKind::SlideKick => MeleeClass { targeting: uu(300.0), extent: v(40.0), offset: Vec3::ZERO, damage: 60.0 },
         // TraceOffset (30, 0, 0): 30 uu ahead.
         MeleeKind::WallRunKick => MeleeClass { targeting: uu(300.0), extent: v(30.0), offset: Vec3::new(0.0, 0.0, -uu(30.0)), damage: 80.0 },
+        // TdMove_MeleeVault: TraceExtent (60, 60, 160), MeleeDamage from TdMove_MeleeBase.
+        MeleeKind::VaultKick => MeleeClass { targeting: uu(800.0), extent: Vec3::new(uu(60.0), uu(160.0), uu(60.0)), offset: Vec3::ZERO, damage: 50.0 },
     }
 }
 
@@ -131,7 +136,7 @@ impl Controller {
         }
         Some(match m.kind {
             MeleeKind::AirKick if m.air_type == 2 => "LeftFoot",
-            MeleeKind::AirKick | MeleeKind::SlideKick => "RightFoot",
+            MeleeKind::AirKick | MeleeKind::SlideKick | MeleeKind::VaultKick => "RightFoot",
             MeleeKind::WallRunKick if m.left => "LeftLeg",
             MeleeKind::WallRunKick => "RightLeg",
             MeleeKind::Punch if m.left => "LeftHand",
@@ -224,6 +229,8 @@ impl Controller {
                 }
             }
             MeleeKind::SlideKick => self.deal(&t, c.damage, facing * speed2d * 1.6),
+            // ImpactMomentum: Vector(Rotation) x 200.
+            MeleeKind::VaultKick => self.deal(&t, c.damage, facing * uu(200.0)),
             MeleeKind::WallRunKick => {
                 self.deal(&t, c.damage, facing * uu(500.0));
                 self.vel.x *= -0.5;
@@ -270,6 +277,10 @@ impl Controller {
             if *d <= 0.0 {
                 m.detect_in = None;
                 m.detecting = true;
+                // TdMove_MeleeVault.TriggerMove: the kick's clip with its hit detection.
+                if m.kind == MeleeKind::VaultKick {
+                    self.events.push(Event::Melee { kind: m.kind, left: false });
+                }
             }
         }
         self.melee = Some(m);
@@ -290,6 +301,8 @@ impl Controller {
             },
             (MeleeKind::SlideKick, _) => clips.slide,
             (MeleeKind::WallRunKick, _) => clips.wallrun,
+            // The clip starts with the kick, 0.3 s in.
+            (MeleeKind::VaultKick, _) => VAULT_KICK_AT + clips.vault_kick,
         };
         if m.t < length {
             return;
@@ -364,6 +377,25 @@ impl Controller {
             _ => m.detect_in = Some(0.15),
         }
         m.momentum = self.vel * 1.6;
+    }
+
+    /// TdMove_MeleeVault.StartMove: the target now, the kick (TriggerMove) 0.3 s on.
+    pub(crate) fn start_vault_kick(&mut self) {
+        let kind = MeleeKind::VaultKick;
+        self.melee = Some(crate::controller::Melee {
+            kind,
+            t: 0.0,
+            left: false,
+            phase: MeleePhase::Start,
+            target: self.melee_target(kind),
+            air_type: 0,
+            detecting: false,
+            detect_in: Some(VAULT_KICK_AT),
+            queued: 0,
+            combo: 0,
+            window: 0.0,
+            momentum: Vec3::ZERO,
+        });
     }
 
     /// TdMove_MeleeWallrun.TriggerMove: off the wall at the target, or 33 degrees out from it.

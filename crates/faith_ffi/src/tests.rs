@@ -223,7 +223,7 @@ fn animates_and_poses_a_skeleton() {
 fn layout_matches_the_header() {
     assert_eq!(std::mem::size_of::<FaithVec3>(), 12);
     assert_eq!(std::mem::size_of::<FaithInput>(), 24);
-    assert_eq!(std::mem::size_of::<FaithFrame>(), 112);
+    assert_eq!(std::mem::size_of::<FaithFrame>(), 120);
     assert_eq!(std::mem::size_of::<FaithXform>(), 32);
     assert_eq!(std::mem::size_of::<FaithCourseVertex>(), 36);
     assert_eq!(std::mem::size_of::<FaithCourse>(), 28);
@@ -232,6 +232,7 @@ fn layout_matches_the_header() {
     assert_eq!(std::mem::size_of::<crate::body::FaithPartInfo>(), 20);
     assert_eq!(std::mem::offset_of!(FaithFrame, events), 96);
     assert_eq!(std::mem::offset_of!(FaithFrame, speed_blur), 108);
+    assert_eq!(std::mem::offset_of!(FaithFrame, game_speed), 116);
 }
 
 /// The Moves map far out in the host's world: she stands on its first roof, springboards up to
@@ -387,7 +388,7 @@ fn set_world_timing() {
 #[test]
 fn takedowns_from_the_front_and_behind() {
     use super::melee::*;
-    assert_eq!(std::mem::size_of::<FaithTakedown>(), 36);
+    assert_eq!(std::mem::size_of::<FaithTakedown>(), 60);
     for (facing_y, back) in [(-1.0, false), (1.0, true)] {
         let h = new();
         world(h, 0.0);
@@ -416,7 +417,12 @@ fn takedowns_from_the_front_and_behind() {
         let (s, e) = (got[0], got[1]);
         assert!(s.target == 7 && s.done == 0 && e.target == 7 && e.done == 1);
         assert_eq!(s.anim == 3, back, "anim {}", s.anim);
-        assert!((s.enemy_dir.y + 1.0).abs() < 0.1, "their clip faces her (south): {:?}", Vec3::from(s.enemy_dir));
+        // They keep facing as they stood; their side of it is laid out from her spot, at them
+        // (north), and her spot is DisarmOffset in front of them (or behind: the same place
+        // here, as they stand facing her or away from her).
+        assert!((s.enemy_dir.y - facing_y).abs() < 0.1, "they face as they stood: {:?}", Vec3::from(s.enemy_dir));
+        assert!((s.clip_dir.y - 1.0).abs() < 0.1, "the clip points at them: {:?}", Vec3::from(s.clip_dir));
+        assert!(s.clip_at.y.abs() < 0.1 * U, "her spot 1.26 m short of them: {:?}", Vec3::from(s.clip_at));
         unsafe { faith_destroy(h) };
     }
 }
@@ -465,5 +471,34 @@ fn the_victim_binds_and_poses() {
         }
     }
     assert!(rots.windows(2).any(|w| w[0].angle_between(w[1]) > 0.1), "the forearm moves");
+    unsafe { faith_destroy(h) };
+}
+
+/// How long a frame of Faith's own work takes (movement, animation, sound) running a training
+/// course with Mirror's Edge's animations: run with --ignored --nocapture.
+#[test]
+#[ignore]
+fn frame_time() {
+    let Some(dir) = std::env::var_os("ME_INSTALL") else { return };
+    let dir = CString::new(dir.to_string_lossy().into_owned()).unwrap();
+    let h = unsafe { faith_create(dir.as_ptr(), U) };
+    assert_eq!(unsafe { faith_animated(h) }, 1);
+    let anchor = FaithVec3 { x: 0.0, y: 0.0, z: 20000.0 };
+    assert_eq!(unsafe { faith_course_start(h, 3, anchor) }, 1);
+    let mut times = vec![];
+    let mut f = FaithFrame::default();
+    for i in 0..1800 {
+        let input = FaithInput { move_y: 1.0, jump_pressed: (i % 90 == 0) as u8, melee_pressed: (i % 200 == 100) as u8, ..Default::default() };
+        let t = std::time::Instant::now();
+        unsafe { faith_step(h, 1.0 / 60.0, &input, &mut f) };
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        if ms > 1.0 {
+            eprintln!("frame {i}: {ms:.2} ms, events {:#x}, ground {}", f.events, f.on_ground);
+        }
+        times.push(ms);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    eprintln!("faith_step: mean {mean:.3} ms, median {:.3}, 99% {:.3}, max {:.3}", times[900], times[1782], times[1799]);
     unsafe { faith_destroy(h) };
 }

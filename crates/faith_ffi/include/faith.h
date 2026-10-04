@@ -28,7 +28,7 @@ typedef struct FaithInput {
     uint8_t turn_pressed;       /* the 180 turn */
     uint8_t melee_pressed;      /* attack / barge */
     uint8_t takedown_pressed;   /* a takedown on whoever's in front of her (faith_takedowns) */
-    uint8_t _pad;
+    uint8_t reaction_pressed; /* Reaction Time: starts it when the meter's full */
 } FaithInput;
 
 /* FaithFrame.events */
@@ -71,6 +71,8 @@ typedef struct FaithFrame {
     uint8_t intermediate; /* arms draw in the world's depth this frame (swinging) */
     uint8_t low;          /* crouched or sliding (e.g. sneaking, to the host) */
     float speed_blur;     /* Mirror's Edge's speed blur (TdMotionBlurShader's MotionPacked.r): ~0.5 at full speed */
+    float reaction_energy; /* Reaction Time's meter, 0..100 */
+    float game_speed;      /* the game speed to run at: 1, down to 0.25 while Reaction Time is on (dt is game time) */
 } FaithFrame;
 
 /* Rotation quaternion (x, y, z, w), translation, uniform scale. */
@@ -83,7 +85,7 @@ typedef struct FaithXform {
 #ifdef __cplusplus
 static_assert(sizeof(FaithVec3) == 12, "faith.h layout");
 static_assert(sizeof(FaithInput) == 24, "faith.h layout");
-static_assert(sizeof(FaithFrame) == 112, "faith.h layout");
+static_assert(sizeof(FaithFrame) == 120, "faith.h layout");
 static_assert(sizeof(FaithXform) == 32, "faith.h layout");
 #endif
 
@@ -121,6 +123,10 @@ uint8_t faith_pose_skeleton(Faith* f, int32_t skeleton, FaithXform root_parent, 
  * faith_set_screen_scale = tan(the body's horizontal half FOV) / tan(her arms'). */
 #define FAITH_POSE_SCREEN_MATCH 2u
 void faith_set_screen_scale(Faith* f, float k);
+
+/* Mirror's Edge's auto step-up (TdMove_AutoStepUp, shipped switched off in the game): walking into
+ * something 35-48 uu (about 0.35-0.5 m) high, she steps up onto it instead of stopping. */
+void faith_set_auto_step_up(Faith* f, uint8_t on);
 uint8_t faith_pose_skeleton_ex(Faith* f, int32_t skeleton, FaithXform root_parent, uint32_t flags, FaithXform* out);
 
 /* What moves in the host's world (doors, gates, drawbridges), given again every frame: triangles
@@ -155,8 +161,9 @@ void     faith_set_targets(Faith* f, const FaithTarget* targets, uint32_t count)
 uint32_t faith_melee_hits(Faith* f, FaithHit* out, uint32_t max);  /* this step's; out NULL to count */
 
 /* Mirror's Edge's disarm (TdMOVE_Disarm) as a takedown: FaithInput.takedown_pressed with a
- * target in front of her. At the start (done 0) put the target at enemy_at and hold it there; its
- * side of the takedown (faith_pose_victim) is placed facing enemy_dir (towards her, always); when her clip ends (done 1) it's yours to finish (knock down, kill...).
+ * target in front of her. At the start (done 0) hold the target at enemy_at facing enemy_dir (as
+ * it stood: she goes round to where the takedown needs her); pose its side of it
+ * (faith_pose_victim) at clip_at facing clip_dir (her spot, the way she faces them); when her clip ends (done 1) it's yours to finish (knock down, kill...).
  * anim: 0-2 a front snatch, 3 from behind. */
 typedef struct FaithTakedown {
     uint32_t target;
@@ -164,9 +171,11 @@ typedef struct FaithTakedown {
     uint32_t done;
     FaithVec3 enemy_at;
     FaithVec3 enemy_dir;
+    FaithVec3 clip_at;
+    FaithVec3 clip_dir;
 } FaithTakedown;
 #ifdef __cplusplus
-static_assert(sizeof(FaithTakedown) == 36, "faith.h layout");
+static_assert(sizeof(FaithTakedown) == 60, "faith.h layout");
 #endif
 uint32_t faith_takedowns(Faith* f, FaithTakedown* out, uint32_t max);  /* this step's; out NULL to count */
 
@@ -191,7 +200,7 @@ typedef struct FaithFixtureCandidate {
     uint32_t capsule;
 } FaithFixtureCandidate;
 typedef struct FaithFixture {
-    uint32_t kind;   /* 0 zipline (a: the high end), 1 swing pole, 2 balance beam */
+    uint32_t kind;   /* 0 zipline (a: the high end), 1 swing pole, 2 balance beam, 3 drainpipe (a: its foot, b: the top) */
     FaithVec3 a, b;
 } FaithFixture;
 #ifdef __cplusplus
