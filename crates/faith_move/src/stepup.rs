@@ -40,9 +40,10 @@ impl Controller {
             return false;
         }
         let inside = hit.at - hit.n * 0.02;
-        let top = column_top(world, inside, self.feet.y, self.feet.y + uu(48.0) + 0.05);
+        let max = tu.auto_step_up_max;
+        let top = column_top(world, inside, self.feet.y, self.feet.y + max + 0.05);
         let height = top - self.feet.y;
-        if height <= tu.step_height || height > uu(48.0) {
+        if height <= tu.step_height || height > max {
             return false;
         }
         let to_ledge = horiz(hit.at - self.feet).length();

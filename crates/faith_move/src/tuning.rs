@@ -347,6 +347,9 @@ pub struct Tuning {
     /// TdMove_AutoStepUp: walking into something 35-48 uu high steps up onto it. Mirror's Edge
     /// ships it switched off (its levels ramp their stairs); for hosts whose stairs aren't.
     pub auto_step_up: bool,
+    /// The tallest step it takes (StepUpHighMaxHeight, 48 uu). Hosts whose world is built of
+    /// half-metre steps raise it a hair over them.
+    pub auto_step_up_max: f32,
     /// ME: TdMove_MeleeCrouch.SpeedModifier = 0.2 / guess for standing
     pub melee_speed: f32,
 }
@@ -517,6 +520,7 @@ impl Default for Tuning {
             air_barge_clips: [1.0, 0.6, 0.8],
             climb_curves: None,
             auto_step_up: false,
+            auto_step_up_max: uu(48.0),
             melee_speed: 0.4,
         }
     }

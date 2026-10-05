@@ -45,6 +45,9 @@ pub struct Ladder {
     /// Out from the wall (horizontal): where she climbs from.
     pub normal: Vec3,
     pub pipe: bool,
+    /// Whether she can climb out over the top (TdLadderVolume.bCanExitAtTop): not where the wall
+    /// carries on above the ladder.
+    pub exit: bool,
 }
 
 /// TdLadderVolume.StepHeight.
@@ -409,7 +412,10 @@ impl Controller {
             fast = true;
             self.events.push(Event::ClimbSlide);
         } else if up {
-            if step >= last {
+            if step >= last && !l.exit {
+                // bCanExitAtTop off: holding on at the top.
+                return;
+            } else if step >= last {
                 // ExitAtTop (bClimbLeftHand ? RightHand : LeftHand).
                 let exit_left = !left;
                 self.state = State::ClimbExit { ladder: l, t: 0.0, from: self.feet, left: exit_left };

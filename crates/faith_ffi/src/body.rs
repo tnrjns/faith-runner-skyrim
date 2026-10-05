@@ -153,6 +153,28 @@ pub unsafe extern "C" fn faith_body_material_name(h: *mut Faith, part: u32, mate
     f.names.last().unwrap().as_ptr()
 }
 
+/// Where one of her bones is this frame (after `faith_step`), in camera space as
+/// faith_body_skin's vertices: for what the host puts in her hands. 0: no such bone or no pose.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faith_body_bone(h: *mut Faith, name: *const c_char, out: *mut crate::FaithXform) -> u8 {
+    let Some(f) = (unsafe { handle(h) }) else { return 0 };
+    guard(0, || {
+        let (Some(frame), Some((arms, rig)), Some(o)) = (f.last, &f.anim, unsafe { out.as_mut() }) else { return 0 };
+        if name.is_null() {
+            return 0;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        let Some(b) = arms.bone(&name) else { return 0 };
+        let Some(g) = rig.driver.globals.get(b) else { return 0 };
+        // Mesh space is the view's flipped and in centimetres: a flip leaves rotations as they are.
+        let to_cam = frame.cam_rot.inverse();
+        let rot = (to_cam * frame.body_rot * Quat::from_mat4(g)).normalize();
+        let pos = to_cam * (frame.body_rot * me_assets::pose::to_view(g.w_axis.truncate()) + frame.origin - frame.cam_pos) * f.frame.units_per_meter;
+        *o = crate::FaithXform { rot: rot.to_array(), pos: pos.to_array(), scale: 1.0 };
+        1
+    })
+}
+
 /// This frame's pose of a part (after `faith_step`), `vertex_count` vertices into `out`, in
 /// the camera's space. Returns 1 if skinned.
 #[unsafe(no_mangle)]

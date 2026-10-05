@@ -225,6 +225,7 @@ fn layout_matches_the_header() {
     assert_eq!(std::mem::size_of::<FaithInput>(), 24);
     assert_eq!(std::mem::size_of::<FaithFrame>(), 120);
     assert_eq!(std::mem::size_of::<FaithXform>(), 32);
+    assert_eq!(std::mem::size_of::<crate::host_fixtures::FaithHostFixture>(), 48);
     assert_eq!(std::mem::size_of::<FaithCourseVertex>(), 36);
     assert_eq!(std::mem::size_of::<FaithCourse>(), 28);
     assert_eq!(std::mem::size_of::<crate::body::FaithVertex>(), 48);

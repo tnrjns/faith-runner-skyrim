@@ -153,6 +153,13 @@ pub struct Faith {
     host_tris: Vec<f32>,
     /// Thin capsules and boxes in it that may be ziplines, swing poles or beams (host frame).
     host_candidates: Vec<world_fixtures::FaithFixtureCandidate>,
+    /// The host's own fixtures (faith_set_host_fixtures), and where they start in the world's
+    /// fixture list; the doors she burst open this step (host indices).
+    pub(crate) host_fixtures: Vec<host_fixtures::FaithHostFixture>,
+    host_fixtures_base: usize,
+    /// Each host fixture in the world's list (from host_fixtures_base on): its index in the host's.
+    host_fixture_index: Vec<u32>,
+    pub(crate) doors_opened: Vec<u32>,
     ctrl: Controller,
     fx: CameraFx,
     look: LookLimiter,
@@ -258,6 +265,10 @@ impl Faith {
             origin: [0.0; 3],
             host_tris: vec![],
             host_candidates: vec![],
+            host_fixtures: vec![],
+            host_fixtures_base: 0,
+            host_fixture_index: vec![],
+            doors_opened: vec![],
             ctrl,
             fx,
             look: LookLimiter::default(),
@@ -320,6 +331,12 @@ impl Faith {
             })
             .collect();
         self.world.fixtures = faith_move::fixtures::classify(&self.world, &cands);
+        self.host_fixtures_base = self.world.fixtures.len();
+        let (index, own): (Vec<u32>, Vec<_>) = self.host_fixtures_local().into_iter().unzip();
+        self.host_fixture_index = index;
+        self.world.fixtures.extend(own);
+        // Doors are known by their place in the list, which has just been rebuilt.
+        self.ctrl.doors_open.clear();
     }
 
     /// Re-centre faith_move's origin on the player once they've gone far from it (standing on
@@ -383,6 +400,16 @@ impl Faith {
             self.ctrl.step(dt, &input, &self.world);
         }
         self.hits.clear();
+        self.doors_opened.clear();
+        if self.course.is_none() {
+            for e in &self.ctrl.events {
+                if let faith_move::Event::DoorOpened { door } = *e {
+                    if let Some(&i) = door.checked_sub(self.host_fixtures_base).and_then(|d| self.host_fixture_index.get(d)) {
+                        self.doors_opened.push(i);
+                    }
+                }
+            }
+        }
         self.takedowns.clear();
         for e in &self.ctrl.events {
             match *e {
@@ -513,6 +540,7 @@ impl Faith {
 mod audio;
 pub mod body;
 pub mod course;
+pub mod host_fixtures;
 pub mod melee;
 pub mod moving;
 pub mod surfaces;
@@ -775,5 +803,15 @@ mod tests;
 pub unsafe extern "C" fn faith_set_auto_step_up(h: *mut Faith, on: u8) {
     if let Some(f) = unsafe { handle(h) } {
         f.ctrl.tuning.auto_step_up = on != 0;
+    }
+}
+
+/// The tallest step the auto step-up takes (host units; Mirror's Edge's is 48 uu, 0.48 m).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faith_set_auto_step_up_max(h: *mut Faith, height: f32) {
+    if let Some(f) = unsafe { handle(h) } {
+        if height.is_finite() && height > 0.0 {
+            f.ctrl.tuning.auto_step_up_max = height / f.frame.units_per_meter;
+        }
     }
 }

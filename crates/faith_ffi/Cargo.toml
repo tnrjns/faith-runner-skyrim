@@ -5,8 +5,8 @@ edition = "2024"
 description = "C interface to faith_move / faith_anim, for running Faith inside another game (the Skyrim plugin)"
 
 [lib]
-# staticlib: linked into the SKSE plugin; rlib for the tests.
-crate-type = ["staticlib", "rlib"]
+# staticlib: linked into the SKSE plugin; cdylib: loaded by the Minecraft mod; rlib for the tests.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 faith_move = { path = "../faith_move" }

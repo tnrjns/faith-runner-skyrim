@@ -235,3 +235,42 @@ fn a_flickering_walk_state_doesnt_spam_steps() {
     assert!(flicker <= steady * 2 + 2, "steady {steady} steps, flickering {flicker}");
 }
 
+
+/// Vaulting a block-high wall: after the vault, the camera comes off her eye smoothly (no lurch
+/// ahead as the vault clip's tail fades). Prints each frame with --nocapture.
+#[test]
+fn camera_after_a_vault_stays_with_her() {
+    let Some(arms) = arms() else { return };
+    use faith_move::{Aabb, BoxWorld, CameraFx, CameraFxSettings, Controller, Input, State, Tuning};
+    use glam::{Vec2, Vec3};
+    let mut w = BoxWorld::default();
+    w.add(Aabb::new(Vec3::new(-50.0, -1.0, -50.0), Vec3::new(50.0, 0.0, 50.0)));
+    w.add(Aabb::new(Vec3::new(-4.0, 0.0, -7.0), Vec3::new(4.0, 1.0, -6.0)));
+    let mut c = Controller::new(Tuning::default(), Vec3::ZERO, 0.0);
+    c.state = State::Ground;
+    let mut fx = CameraFx::new(CameraFxSettings::animation_driven());
+    let mut rig = Rig::new(&arms, c.yaw);
+    let dt = 1.0 / 60.0;
+    let mut jumped = false;
+    let mut worst: f32 = 0.0;
+    let mut after = None;
+    for i in 0..150 {
+        let jump = !jumped && c.feet.z < -4.6;
+        jumped |= jump;
+        let input = Input { move_axis: Vec2::new(0.0, 1.0), jump_pressed: jump, ..Default::default() };
+        c.step(dt, &input, &w);
+        let shot = fx.update(dt, &c, &input);
+        let r = rig.update(dt, &c, &shot, &arms);
+        let ahead = -(r.cam_pos.z - c.view().eye.z);
+        if matches!(c.state, State::Vault(_)) {
+            after = Some(0);
+        } else if let Some(n) = &mut after {
+            *n += 1;
+            if *n < 40 {
+                worst = worst.max(ahead);
+            }
+        }
+        eprintln!("{i} {} ahead {ahead:.2} align {:.2} | {}", c.state.name(), r.body.align, rig.driver.layer_summary());
+    }
+    assert!(worst < 0.25, "the camera lurched {worst:.2} m ahead of her after the vault");
+}

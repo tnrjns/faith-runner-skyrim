@@ -1598,7 +1598,7 @@ fn swing_to_swing() {
 fn ladder_wall(pipe: bool) -> BoxWorld {
     let mut w = floor();
     w.add(Aabb::new(Vec3::new(-5.0, 0.0, -9.0), Vec3::new(5.0, 4.0, -6.0)));
-    w.fixtures.push(Fixture::Ladder(Ladder { base: Vec3::new(0.0, 0.0, -6.0), top: 4.0, normal: Vec3::Z, pipe }));
+    w.fixtures.push(Fixture::Ladder(Ladder { base: Vec3::new(0.0, 0.0, -6.0), top: 4.0, normal: Vec3::Z, pipe, exit: true }));
     w
 }
 
@@ -1613,6 +1613,22 @@ fn climb_a_ladder_onto_the_roof() {
         assert!(ev.iter().any(|e| matches!(e, Event::ClimbStart { .. })) || ev.iter().any(|e| matches!(e, Event::ClimbStep)), "pipe {pipe}: {ev:?}");
         assert!(has(&ev, Event::ClimbExit), "pipe {pipe}: {ev:?} {:?} {:?}", c.feet, c.state);
         assert!((c.feet.y - 4.0).abs() < 0.05 && c.feet.z < -6.0 && c.state == State::Ground, "pipe {pipe}: on the roof: {:?} {:?}", c.feet, c.state);
+    }
+}
+
+/// bCanExitAtTop off: holding up at the top she stays on the ladder, at its last step.
+#[test]
+fn ladder_without_an_exit_holds_her_at_the_top() {
+    for pipe in [false, true] {
+        let mut w = ladder_wall(pipe);
+        if let Some(Fixture::Ladder(l)) = w.fixtures.last_mut() {
+            l.exit = false;
+        }
+        let mut c = ctrl_at(Vec3::new(0.0, 0.0, -3.0));
+        let ev = run(&mut c, &w, 9.0, |_, _| fwd());
+        assert!(!has(&ev, Event::ClimbExit), "pipe {pipe}: {ev:?}");
+        assert!(matches!(c.state, State::Climb { .. }), "pipe {pipe}: {:?}", c.state);
+        assert!(c.feet.y < 4.0, "pipe {pipe}: above the top: {:?}", c.feet);
     }
 }
 

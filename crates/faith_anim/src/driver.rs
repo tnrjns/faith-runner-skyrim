@@ -1250,27 +1250,30 @@ impl Driver {
         // ---- pose
         let mut blended = self.rest.clone();
         let mut total = 0.0;
-        let mut align = 0.0;
+        let align: f32 = 0.0;
+        let eye_height = c.view().eye.y - c.root().y;
         let layers = std::mem::take(&mut self.layers);
         for l in &layers {
             if l.weight <= 0.0 {
                 continue;
             }
-            let (p, travel) = self.layer_pose(arms, &l.src);
+            let (mut p, travel) = self.layer_pose(arms, &l.src);
+            if travel {
+                // A travel clip (vault, climb, pull-up) carries the body through space, which
+                // gameplay already moves her through: its camera goes on her eye. Re-anchored
+                // here, before blending, so it blends with the other layers in one placement
+                // (placing the blend part by eye and part by feet sent the view lurching ahead
+                // as a vault clip faded out).
+                self.anchor_travel(arms, &mut p, eye_height);
+            }
             total += l.weight;
             if total <= l.weight + 1e-6 {
                 blended = p;
             } else {
                 blended.blend_toward(&p, l.weight / total);
             }
-            if travel {
-                align += l.weight;
-            }
         }
         self.layers = layers;
-        if total > 0.0 {
-            align /= total;
-        }
         if let Some(l) = self.land {
             self.apply_landing(arms, &l, raw_speed, c, &mut blended);
         }
@@ -1672,6 +1675,20 @@ impl Driver {
     /// Sound cues the animations hit this update (footsteps, cloth, breathsâ€¦).
     pub fn notifies(&self) -> &[Notify] {
         &self.fired
+    }
+
+    /// Moves a pose (by its root) so its camera bone sits straight above the root at
+    /// `eye_height` (metres): where the gameplay eye is.
+    fn anchor_travel(&self, arms: &FaithArms, p: &mut Pose, eye_height: f32) {
+        let cam = self.camera_of(arms, p).w_axis.truncate();
+        // Mesh space is the view's flipped, in centimetres (pose::to_view).
+        let target = Vec3::new(0.0, -eye_height * 100.0, 0.0);
+        p.pos[0] += target - cam;
+    }
+
+    /// The layers now: key, weight, dying (for tests).
+    pub fn layer_summary(&self) -> String {
+        self.layers.iter().map(|l| format!("{}:{:.2}{}", l.key, l.weight, if l.dying { "d" } else { "" })).collect::<Vec<_>>().join(" ")
     }
 
     /// Name of the dominant animation right now (for the HUD).

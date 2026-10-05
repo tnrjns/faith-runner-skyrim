@@ -200,8 +200,8 @@ pub fn greybox() -> Level {
     l.add(Wall, [-6.0, -7.0, z::KICK_WALL], [6.0, ROOF_C_Y, z::CLIMB_WALL]);
     l.paint(Runner, [-2.0, ROOF_C_Y - 0.25, z::CLIMB_WALL - 0.01], [2.0, ROOF_C_Y + 0.004, z::CLIMB_WALL + 0.004]);
     // A ladder and a drainpipe up it too, either side of the climb.
-    l.fixtures.push(Fixture::Ladder(crate::climb::Ladder { base: Vec3::new(4.2, ROOF_B_Y, z::CLIMB_WALL), top: ROOF_C_Y, normal: Vec3::Z, pipe: false }));
-    l.fixtures.push(Fixture::Ladder(crate::climb::Ladder { base: Vec3::new(-4.2, ROOF_B_Y, z::CLIMB_WALL), top: ROOF_C_Y, normal: Vec3::Z, pipe: true }));
+    l.fixtures.push(Fixture::Ladder(crate::climb::Ladder { base: Vec3::new(4.2, ROOF_B_Y, z::CLIMB_WALL), top: ROOF_C_Y, normal: Vec3::Z, pipe: false, exit: true }));
+    l.fixtures.push(Fixture::Ladder(crate::climb::Ladder { base: Vec3::new(-4.2, ROOF_B_Y, z::CLIMB_WALL), top: ROOF_C_Y, normal: Vec3::Z, pipe: true, exit: true }));
     // Tall wall to climb, turn and kick off (left half only).
     l.add(Runner, [-6.0, ROOF_C_Y, z::KICK_WALL - 4.0], [0.0, 16.0, z::KICK_WALL]);
     // Catwalk you kick back onto.

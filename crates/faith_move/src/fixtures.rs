@@ -147,7 +147,7 @@ fn drainpipe(world: &MeshWorld, c: &Candidate) -> Option<Fixture> {
     // The top to climb out onto: a floor behind it.
     let back = Vec3::new(hi.x, hi.y + 0.2, hi.z) - normal * (c.thickness + 0.35);
     let top = *tops_below(world, back, 0.1, back.y, lo.y + 1.5).first()?;
-    Some(Fixture::Ladder(crate::climb::Ladder { base: lo, top, normal, pipe: true }))
+    Some(Fixture::Ladder(crate::climb::Ladder { base: lo, top, normal, pipe: true, exit: true }))
 }
 
 /// The candidates that work as Mirror's Edge's fixtures. Pieces of one bar or cable that meet

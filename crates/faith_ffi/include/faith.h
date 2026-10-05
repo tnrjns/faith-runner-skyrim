@@ -283,6 +283,27 @@ const char* faith_body_material_name(Faith* f, uint32_t part, uint32_t material)
 /* This frame's pose (after faith_step): vertex_count vertices. Returns 1 if skinned. */
 uint8_t faith_body_skin(Faith* f, uint32_t part, FaithVertex* out);
 
+/* The host's own fixtures, with the next faith_set_world (replaces the last ones). kind 0 ladder:
+ * a its foot on the wall's face, n out from the wall, top the height she climbs out onto; flags 1
+ * drainpipe, 2 she can climb out over the top. 1 door: the closed door's box a..b, n the side she
+ * comes from. 2 soft landing: the pad's box a..b. */
+typedef struct FaithHostFixture {
+    uint32_t kind, flags;
+    FaithVec3 a, b, n;
+    float top;
+} FaithHostFixture;
+#ifdef __cplusplus
+static_assert(sizeof(FaithHostFixture) == 48, "faith.h layout");
+#endif
+void faith_set_host_fixtures(Faith* f, const FaithHostFixture* fixtures, uint32_t count);
+/* The doors she burst open since the last step (indices into the host fixtures); NULL to count. */
+uint32_t faith_doors_opened(Faith* f, uint32_t* out, uint32_t max);
+/* The tallest step the auto step-up takes (host units; Mirror's Edge's is 0.48 m). */
+void faith_set_auto_step_up_max(Faith* f, float height);
+/* One of her bones this frame, in camera space as faith_body_skin's vertices (what the host puts
+ * in her hands). 0: no such bone. */
+uint8_t faith_body_bone(Faith* f, const char* name, FaithXform* out);
+
 #ifdef __cplusplus
 }
 #endif
